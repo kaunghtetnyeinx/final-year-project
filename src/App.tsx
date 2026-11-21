@@ -599,14 +599,14 @@ function NewSale({
               key={product.id}
               onClick={() => add(product)}
               disabled={inCart(product.id) >= product.stock}
-              className="group rounded-md border border-[#DEDFDA] bg-white p-3 text-left transition hover:border-[#91A59F] disabled:opacity-50"
+              className="group overflow-hidden rounded-md border border-[#DEDFDA] bg-white text-left transition hover:border-[#91A59F] disabled:opacity-50"
             >
               <img
                 src={product.image}
                 alt=""
-                className="h-20 w-full rounded object-cover saturate-[.72]"
+                className="aspect-video w-full object-cover saturate-[.72]"
               />
-              <div className="pt-3">
+              <div className="p-3">
                 <div className="flex justify-between gap-3">
                   <p className="text-sm font-bold">{product.name}</p>
                   <strong className="shrink-0 text-sm">

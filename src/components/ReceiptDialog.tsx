@@ -31,7 +31,13 @@ export function Receipt({ tx, rates }: { tx: Transaction; rates: Rates }) {
 
       {tx.status !== "POSTED" && (
         <p className="mt-3 border border-dashed border-[#A34E42] py-1 text-center text-[10px] font-bold uppercase tracking-[.1em] text-[#A34E42]">
-          {tx.status} · Not a valid receipt
+          {tx.status === "CANCELLED" && tx.voidedAt ? (isSale ? "Voided" : "Cancelled") : tx.status} · Not a valid receipt
+        </p>
+      )}
+      {tx.voidedAt && (
+        <p className="mt-1 text-center text-[10px] text-[#A34E42]">
+          {myDateTime(tx.voidedAt)} by {tx.voidedBy}
+          {tx.voidReason ? ` · ${tx.voidReason}` : ""}
         </p>
       )}
 
@@ -48,6 +54,13 @@ export function Receipt({ tx, rates }: { tx: Transaction; rates: Rates }) {
               <span className="font-bold">{line.name}</span>
               <span className="tabular-nums">{money(line.unitPrice * line.quantity)}</span>
             </div>
+            {line.options.length > 0 && (
+              <div className="text-[10px]">
+                {line.options
+                  .map((o) => (o.priceDelta > 0 ? `${o.name} +${money(o.priceDelta)}` : o.name))
+                  .join(", ")}
+              </div>
+            )}
             <div className="text-[10px] text-[#5F655F]">
               {line.quantity} x {unitMoney(line.unitPrice)}
               {isSale ? "" : " (cost)"} · {line.sku}
@@ -60,6 +73,9 @@ export function Receipt({ tx, rates }: { tx: Transaction; rates: Rates }) {
       <Row label={`Subtotal (${units} ${units === 1 ? "item" : "items"})`} value={money(tx.subtotal)} />
       {isSale && (
         <>
+          {tx.discount > 0 && (
+            <Row label={`Discount${tx.discountReason ? ` (${tx.discountReason})` : ""}`} value={`-${money(tx.discount)}`} />
+          )}
           <Row label={`Service charge ${ratePct(rates.serviceChargeRate)}%`} value={money(tx.serviceCharge)} />
           <Row label={`SST ${ratePct(rates.sstRate)}%`} value={money(tx.tax)} />
           <Row label="Rounding adj." value={signedMoney(tx.rounding)} />
@@ -73,6 +89,12 @@ export function Receipt({ tx, rates }: { tx: Transaction; rates: Rates }) {
       {isSale && tx.payment && (
         <div className="mt-1">
           <Row label="Paid by" value={tx.payment} />
+          {tx.payment === "Cash" && tx.cashReceived !== null && (
+            <>
+              <Row label="Cash received" value={money(tx.cashReceived)} />
+              <Row label="Change" value={money(Math.max(0, tx.cashReceived - tx.total))} strong />
+            </>
+          )}
         </div>
       )}
       <Rule />
@@ -137,7 +159,7 @@ export default function ReceiptDialog({
             </h2>
             <p className="text-[11px] text-[#767A74]">
               {success
-                ? `${tx.number} · Paid via ${tx.payment} · ${money(tx.total)}`
+                ? `${tx.number} · Paid via ${tx.payment} · ${money(tx.total)}${tx.payment === "Cash" && tx.cashReceived !== null ? ` · Change ${money(Math.max(0, tx.cashReceived - tx.total))}` : ""}`
                 : `${tx.type === "SALE" ? "Sale" : "Purchase"} · ${tx.status} · ${money(tx.total)}`}
             </p>
           </div>

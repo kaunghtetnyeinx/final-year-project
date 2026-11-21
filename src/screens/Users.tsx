@@ -42,12 +42,12 @@ export default function Users({ currentUserId }: { currentUserId: number }) {
     u.name,
     u.email,
     u.role,
-    u.isActive ? "Active" : "Inactive",
+    !u.isActive ? "Inactive" : u.mustChangePassword ? "Temporary password" : "Active",
     myDate(new Date(u.createdAt)),
   ])
 
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-8">
       <Heading
         title="Users"
         subtitle="Staff accounts and application roles. Deactivate accounts to preserve audit history."

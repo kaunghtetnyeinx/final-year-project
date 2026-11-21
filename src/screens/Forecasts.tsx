@@ -5,8 +5,30 @@ import Table from "../components/Table"
 import { myDateTime } from "../lib/format"
 import { Forecast, Product } from "../lib/types"
 
-export default function Forecasts({ catalogue, forecasts }: { catalogue: Product[]; forecasts: Forecast[] }) {
+export default function Forecasts({
+  catalogue,
+  forecasts,
+  onRun,
+}: {
+  catalogue: Product[]
+  forecasts: Forecast[]
+  /** Runs the forecast job now and reloads. */
+  onRun: () => Promise<void>
+}) {
   const [reviewed, setReviewed] = useState(false)
+  const [running, setRunning] = useState(false)
+  const [runError, setRunError] = useState("")
+  const run = async () => {
+    setRunning(true)
+    setRunError("")
+    try {
+      await onRun()
+    } catch (err) {
+      setRunError((err as Error).message)
+    } finally {
+      setRunning(false)
+    }
+  }
   // Predicted demand comes from forecast_results (newest run per product). On-hand and
   // the recommendation use live stock, so they stay right after sales and purchases.
   const items = forecasts
@@ -34,7 +56,7 @@ export default function Forecasts({ catalogue, forecasts }: { catalogue: Product
   // One shared scale for demand and stock, so the bar and the stock marker compare directly.
   const scale = Math.max(1, ...items.map(({ forecast, product }) => Math.max(forecast.predicted, product.stock)))
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-8">
       <Heading
         title="Demand forecasts"
         subtitle={
@@ -43,6 +65,19 @@ export default function Forecasts({ catalogue, forecasts }: { catalogue: Product
             : "No forecast results yet."
         }
       />
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-[11px] text-[#7E827C]">
+        <span>
+          Moving average: units sold per day over the last 28 days × 7. Runs automatically once a day.
+        </span>
+        <button
+          onClick={run}
+          disabled={running}
+          className="rounded border border-[#28695E] bg-white px-3 py-2 text-xs font-bold text-[#28695E] disabled:opacity-50"
+        >
+          {running ? "Running…" : "Run forecast now"}
+        </button>
+      </div>
+      {runError && <p className="mt-3 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]">{runError}</p>}
       {items.length === 0 ? (
         <p className="mt-6 rounded border border-dashed border-[#D8D9D4] bg-white p-8 text-center text-xs text-[#8B8F89]">
           No forecasts have been generated yet. When the forecast job writes to
@@ -50,7 +85,7 @@ export default function Forecasts({ catalogue, forecasts }: { catalogue: Product
         </p>
       ) : (
         <>
-          <div className="mt-6 grid grid-cols-[1fr_280px] gap-5">
+          <div className="mt-6 grid gap-5 lg:grid-cols-[1fr_280px]">
             <figure className="rounded border border-[#DEDFDA] bg-white p-5">
               <div className="flex justify-between">
                 <figcaption>

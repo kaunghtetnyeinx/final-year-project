@@ -1,35 +1,38 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import ChangePasswordDialog from "./components/ChangePasswordDialog"
 import Icon from "./components/Icon"
 import MalaysiaClock from "./components/MalaysiaClock"
 import ReceiptDialog from "./components/ReceiptDialog"
 import { api, newRequestId, setSessionLostHandler } from "./lib/api"
 import { DEFAULT_RATES } from "./lib/billing"
 import {
-  CartLine,
-  Category,
-  Forecast,
   INGREDIENTS,
-  Movement,
-  Payment,
-  Product,
-  RecipeLine,
-  SessionUser,
-  Settings,
-  Transaction,
-  View,
-  Wire,
   isIngredient,
   toForecast,
   toMovement,
   toRecipe,
   toTransaction,
+  type CartLine,
+  type Category,
+  type Forecast,
+  type Movement,
+  type Payment,
+  type Product,
+  type RecipeLine,
+  type SessionUser,
+  type Settings,
+  type Transaction,
+  type TransactionWire,
+  type View,
+  type Wire,
 } from "./lib/types"
 import Forecasts from "./screens/Forecasts"
 import Inventory from "./screens/Inventory"
 import Login from "./screens/Login"
-import NewSale from "./screens/NewSale"
+import NewSale, { emptyCheckout, type Checkout } from "./screens/NewSale"
 import Products from "./screens/Products"
 import Recipes from "./screens/Recipes"
+import Reports from "./screens/Reports"
 import StockMovements from "./screens/StockMovements"
 import Transactions from "./screens/Transactions"
 import Users from "./screens/Users"
@@ -42,6 +45,7 @@ export type NavigationItem = {
 export const navigation: NavigationItem[] = [
   { label: "New sale" },
   { label: "Transactions" },
+  { label: "Reports" },
   { label: "Products" },
   { label: "Recipes", admin: true },
   { label: "Inventory", admin: true },
@@ -78,6 +82,13 @@ export default function App() {
     await api("/auth/logout", { method: "POST" }).catch(() => {})
     setUser(null)
   }
+  // Seeded or admin-set temporary password: the user must choose their own first.
+  if (user.mustChangePassword)
+    return (
+      <main className="min-h-screen bg-[#F5F4F0]">
+        <ChangePasswordDialog user={user} forced onDone={setUser} onCancel={signOut} />
+      </main>
+    )
   // Keyed by user, so signing out throws away everything the last person loaded.
   return <Workspace key={user.id} user={user} onSignOut={signOut} />
 }
@@ -87,7 +98,7 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
   const isAdmin = user.role === "ADMIN"
   const [view, setView] = useState<View>("New sale")
   const [catalogue, setCatalogue] = useState<Product[]>([])
-  const [categories, setCategories] = useState<string[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_RATES, targetMargin: 0.6 })
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [movements, setMovements] = useState<Movement[]>([])
@@ -95,8 +106,10 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
   const [forecasts, setForecasts] = useState<Forecast[]>([])
   const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState("")
+  const [passwordOpen, setPasswordOpen] = useState(false)
 
   const [cart, setCart] = useState<CartLine[]>([])
+  const [checkout, setCheckout] = useState<Checkout>(emptyCheckout)
   const [payment, setPayment] = useState<Payment>("Cash")
   const [posting, setPosting] = useState(false)
   const [saleError, setSaleError] = useState("")
@@ -114,7 +127,7 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
         api<{ products: Product[] }>(isAdmin ? "/products?all=1" : "/products"),
         api<{ categories: Category[] }>("/categories"),
         api<{ settings: Settings }>("/settings"),
-        api<{ transactions: Wire<Transaction, "at">[] }>("/transactions"),
+        api<{ transactions: TransactionWire[] }>("/transactions"),
         isAdmin
           ? Promise.all([
               api<{ recipes: Wire<RecipeLine, "createdAt" | "updatedAt">[] }>("/recipes"),
@@ -125,7 +138,7 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
       ])
       if (seq !== loadSeq.current) return
       setCatalogue(p.products)
-      setCategories(c.categories.map((category) => category.name))
+      setCategories(c.categories)
       setSettings(s.settings)
       setTransactions(t.transactions.map(toTransaction))
       if (adminData) {
@@ -147,12 +160,15 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
     load()
   }, [load, view])
 
-  // Drop cart lines whose product was deactivated or removed since it was added.
+  // Drop cart lines whose product (or option) was switched off since it was added.
   useEffect(() => {
     setCart((current) => {
-      const kept = current.filter((line) =>
-        catalogue.some((p) => p.id === line.productId && p.isActive && !isIngredient(p)),
-      )
+      const kept = current.filter((line) => {
+        const p = catalogue.find((x) => x.id === line.productId)
+        return (
+          p && p.isActive && !isIngredient(p) && line.optionIds.every((id) => p.options.some((o) => o.id === id))
+        )
+      })
       return kept.length === current.length ? current : kept
     })
   }, [catalogue])
@@ -169,13 +185,17 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
     setSaleRequestId(requestId)
     setPosting(true)
     setSaleError("")
+    const discount = Number(checkout.discount) || 0
+    const cash = checkout.cashReceived.trim() === "" ? undefined : Number(checkout.cashReceived)
     try {
-      const { sale } = await api<{ sale: Wire<Transaction, "at"> }>("/sales", {
+      const { sale } = await api<{ sale: TransactionWire }>("/sales", {
         method: "POST",
         body: {
           requestId,
           payment,
-          lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity })),
+          lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity, optionIds: line.optionIds })),
+          ...(discount > 0 ? { discount, discountReason: checkout.discountReason.trim() } : {}),
+          ...(payment === "Cash" && cash !== undefined && Number.isFinite(cash) ? { cashReceived: cash } : {}),
         },
       })
       setSaleRequestId(null)
@@ -186,16 +206,6 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
       setPosting(false)
       load() // fresh stock either way
     }
-  }
-
-  const postPurchase = async (productId: number, quantity: number, unitCost: number) => {
-    await api("/purchases", { method: "POST", body: { productId, quantity, unitCost } })
-    await load()
-  }
-
-  const adjustStock = async (productId: number, change: number, reason: string) => {
-    await api("/inventory/adjustments", { method: "POST", body: { productId, change, reason } })
-    await load()
   }
 
   const applyPrice = async (productId: number, price: number) => {
@@ -214,52 +224,57 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
     setSettings(saved)
   }
 
+  const runForecast = async () => {
+    await api("/forecasts/run", { method: "POST" })
+    await load()
+  }
+
   const allowed = (item: NavigationItem) => !item.admin || isAdmin
-  const lowStockCount = catalogue.filter((p) => p.isActive && p.stock <= p.reorder).length
+  const lowStockCount = catalogue.filter((p) => p.isActive && p.trackStock && p.stock <= p.reorder).length
 
   return (
-    <main className="flex h-screen min-w-[1100px] flex-col overflow-hidden bg-[#F3F3F1] text-[#24302C]">
-      <header className="flex h-16 shrink-0 items-center border-b border-[#E2E3DF] bg-white px-6">
-        <div className="w-[205px] font-display text-base font-bold text-[#28695E]">
-          Juniper Cafe
-        </div>
-        <div className="flex-1 text-center text-[10px] text-[#858984]">
-          Main Store · MYR
-        </div>
-        <div className="flex w-[340px] items-center justify-end gap-3 text-[10px]">
-          <MalaysiaClock />
-          <span>
+    <main className="flex h-screen flex-col overflow-hidden bg-[#F3F3F1] text-[#24302C]">
+      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-[#E2E3DF] bg-white px-4 lg:h-16 lg:px-6">
+        <div className="font-display text-base font-bold text-[#28695E] lg:w-[205px]">Juniper Cafe</div>
+        <div className="hidden flex-1 text-center text-[10px] text-[#858984] md:block">Main Store · MYR</div>
+        <div className="ml-auto flex min-w-0 items-center justify-end gap-3 text-[10px]">
+          <span className="hidden sm:inline">
+            <MalaysiaClock />
+          </span>
+          <span className="truncate">
             {user.name} · {user.role}
           </span>
-          <button onClick={onSignOut} title="Sign out" aria-label="Sign out">
+          <button
+            onClick={() => setPasswordOpen(true)}
+            className="shrink-0 rounded border border-[#D9DAD5] px-2 py-1 font-bold text-[#28695E]"
+          >
+            Password
+          </button>
+          <button onClick={onSignOut} title="Sign out" aria-label="Sign out" className="shrink-0 p-1">
             <Icon name="logout" />
           </button>
         </div>
       </header>
-      <div className="flex min-h-0 flex-1">
-        <aside className="flex w-[205px] shrink-0 flex-col border-r border-[#E0E1DD] bg-white py-7">
-          <nav className="flex flex-col">
-            {navigation.map((item) => (
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        {/* Side menu on wide screens; a scrolling bar under the header on tablets. */}
+        <aside className="shrink-0 overflow-x-auto border-b border-[#E0E1DD] bg-white lg:w-[205px] lg:overflow-visible lg:border-b-0 lg:border-r lg:py-7">
+          <nav className="flex lg:flex-col">
+            {navigation.filter(allowed).map((item) => (
               <button
                 key={item.label}
-                disabled={!allowed(item)}
-                onClick={() => allowed(item) && setView(item.label)}
-                className={`relative flex items-center px-5 py-3 text-left text-xs ${
+                onClick={() => setView(item.label)}
+                aria-current={view === item.label ? "page" : undefined}
+                className={`relative flex shrink-0 items-center whitespace-nowrap px-4 py-3 text-left text-xs lg:px-5 ${
                   view === item.label
-                    ? "font-bold text-[#28695E] before:absolute before:inset-y-2 before:left-0 before:w-0.5 before:bg-[#28695E]"
+                    ? "font-bold text-[#28695E] before:absolute before:inset-x-3 before:bottom-0 before:h-0.5 before:bg-[#28695E] lg:before:inset-x-auto lg:before:inset-y-2 lg:before:left-0 lg:before:h-auto lg:before:w-0.5"
                     : "text-[#777D78] hover:bg-[#F7F7F5]"
-                } disabled:cursor-not-allowed disabled:opacity-30`}
+                }`}
               >
                 <span>{item.label}</span>
-                {!allowed(item) && (
-                  <span className="ml-auto">
-                    <Icon name="lock" size={11} />
-                  </span>
-                )}
-                {item.label === "Inventory" && isAdmin && lowStockCount > 0 && (
+                {item.label === "Inventory" && lowStockCount > 0 && (
                   <span
-                    className="ml-auto rounded-full bg-[#F5E7E3] px-1.5 py-0.5 text-[9px] text-[#A34E42]"
-                    title={`${lowStockCount} products at or below reorder level`}
+                    className="ml-2 rounded-full bg-[#F5E7E3] px-1.5 py-0.5 text-[9px] text-[#A34E42] lg:ml-auto"
+                    title={`${lowStockCount} items at or below reorder level`}
                   >
                     {lowStockCount}
                   </span>
@@ -272,7 +287,7 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
           {loadError && (
             <div
               role="alert"
-              className="mx-8 mt-6 flex items-center justify-between rounded bg-[#F5E7E3] px-4 py-3 text-xs text-[#A34E42]"
+              className="mx-4 mt-6 flex items-center justify-between gap-3 rounded bg-[#F5E7E3] px-4 py-3 text-xs text-[#A34E42] sm:mx-8"
             >
               <span>
                 {loaded && catalogue.length ? "Could not refresh data: " : "Could not load data: "}
@@ -290,9 +305,11 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
               {view === "New sale" && (
                 <NewSale
                   catalogue={catalogue}
-                  categories={categories.filter((name) => name !== INGREDIENTS)}
+                  categories={categories.map((c) => c.name).filter((name) => name !== INGREDIENTS)}
                   cart={cart}
                   setCart={setCart}
+                  checkout={checkout}
+                  setCheckout={setCheckout}
                   rates={settings}
                   payment={payment}
                   onPaymentChange={setPayment}
@@ -307,15 +324,17 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
                   catalogue={catalogue}
                   rates={settings}
                   isAdmin={isAdmin}
-                  onPostPurchase={postPurchase}
+                  onChanged={load}
                 />
               )}
+              {view === "Reports" && <Reports isAdmin={isAdmin} />}
               {view === "Products" && (
                 <Products
                   products={catalogue}
                   categories={categories}
                   isAdmin={isAdmin}
                   onSaved={replaceProduct}
+                  onCategoriesChanged={load}
                 />
               )}
               {view === "Recipes" && (
@@ -329,15 +348,12 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
                 />
               )}
               {view === "Inventory" && (
-                <Inventory
-                  products={catalogue}
-                  recipes={recipes}
-                  movements={movements}
-                  onAdjust={adjustStock}
-                />
+                <Inventory products={catalogue} recipes={recipes} movements={movements} onChanged={load} />
               )}
               {view === "Stock movements" && <StockMovements movements={movements} />}
-              {view === "Forecasts" && <Forecasts catalogue={catalogue} forecasts={forecasts} />}
+              {view === "Forecasts" && (
+                <Forecasts catalogue={catalogue} forecasts={forecasts} onRun={runForecast} />
+              )}
               {view === "Users" && <Users currentUserId={user.id} />}
             </>
           )}
@@ -352,8 +368,16 @@ export function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: (
           onClose={() => {
             setPosted(null)
             setCart([])
+            setCheckout(emptyCheckout)
             setSaleError("")
           }}
+        />
+      )}
+      {passwordOpen && (
+        <ChangePasswordDialog
+          user={user}
+          onDone={() => setPasswordOpen(false)}
+          onCancel={() => setPasswordOpen(false)}
         />
       )}
     </main>

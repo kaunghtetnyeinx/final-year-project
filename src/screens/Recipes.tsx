@@ -183,12 +183,12 @@ export default function Recipes({
   const columns = "minmax(0,2fr) repeat(3, minmax(0,1fr)) minmax(0,1.5fr) minmax(0,1.2fr)"
 
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-8">
       <Heading
         title="Recipes & margins"
         subtitle="Ingredient cost per unit from each recipe, checked against the target profit margin."
       />
-      <div className="mt-6 grid grid-cols-[260px_1fr_1fr_1fr] gap-4">
+      <div className="mt-6 grid grid-cols-2 gap-4 lg:grid-cols-[260px_1fr_1fr_1fr]">
         <label className="rounded border border-[#28695E] bg-[#EAF1EF] p-5 text-xs font-bold text-[#28695E]">
           Target profit margin
           <div className="mt-2 flex items-baseline gap-1">
@@ -225,10 +225,11 @@ export default function Recipes({
         Margin = (selling price − ingredient cost) ÷ selling price. Selling prices exclude
         service charge and SST. Ingredient costs use each ingredient's latest posted purchase.
         Labour, rent and utilities are not in the data model, so this is the ingredient-cost
-        margin. Recipes do not deduct ingredient stock when a sale is posted.
+        margin. Ingredients are used up when a made-to-order item is sold, or when a batch
+        is recorded in Inventory → Record production.
       </p>
 
-      <div className="mt-5 overflow-hidden rounded border border-[#DEDFDA] bg-white">
+      <div className="mt-5 overflow-x-auto rounded border border-[#DEDFDA] bg-white [&>*]:min-w-[760px]">
         <div
           className="grid bg-[#EEEDEA] px-5 py-3 text-[10px] font-bold uppercase tracking-[.1em] text-[#777C76]"
           style={{ gridTemplateColumns: columns }}
@@ -519,7 +520,7 @@ export function RecipeDetail({
             Transactions to calculate the margin.
           </p>
         )}
-        <div className="mt-3 overflow-hidden rounded border border-[#E4E5E0]">
+        <div className="mt-3 overflow-x-auto rounded border border-[#E4E5E0] [&>*]:min-w-[860px]">
           <div className="grid grid-cols-[minmax(0,2fr)_90px_110px_100px_70px_minmax(0,1.6fr)_100px_120px] bg-[#F3F3F1] px-4 py-2.5 text-[10px] font-bold uppercase tracking-[.1em] text-[#777C76]">
             {["Ingredient", "Quantity", "Unit cost", "Line cost", "Share", "Notes", "Updated", ""].map((h, i) => (
               <span key={i}>{h}</span>
@@ -583,7 +584,7 @@ export function RecipeDetail({
           {error && (
             <p className="mt-2 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]">{error}</p>
           )}
-          <div className="mt-3 grid grid-cols-[minmax(0,2fr)_110px_100px_minmax(0,2fr)_auto] items-end gap-3">
+          <div className="mt-3 grid grid-cols-2 items-end gap-3 lg:grid-cols-[minmax(0,2fr)_110px_100px_minmax(0,2fr)_auto]">
             <label className="text-[11px] font-bold text-[#666A65]">
               Ingredient
               <select

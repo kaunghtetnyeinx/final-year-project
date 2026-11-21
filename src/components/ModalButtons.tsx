@@ -1,5 +1,16 @@
-
-export default function ModalButtons({ busy, label, busyLabel, onClose }: { busy: boolean; label: string; busyLabel: string; onClose: () => void }) {
+export default function ModalButtons({
+  busy,
+  label,
+  busyLabel,
+  onClose,
+  cancelLabel = "Cancel",
+}: {
+  busy: boolean
+  label: string
+  busyLabel: string
+  onClose: () => void
+  cancelLabel?: string
+}) {
   return (
     <>
       <button
@@ -14,7 +25,7 @@ export default function ModalButtons({ busy, label, busyLabel, onClose }: { busy
         onClick={onClose}
         className="mt-3 w-full rounded border border-[#D9DAD5] bg-white py-3 text-sm font-bold text-[#666A65]"
       >
-        Cancel
+        {cancelLabel}
       </button>
     </>
   )

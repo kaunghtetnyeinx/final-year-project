@@ -28,8 +28,8 @@ export default function Login({ onLogin }: { onLogin: (user: SessionUser) => voi
     }
   }
   return (
-    <main className="grid min-h-screen grid-cols-[1fr_1fr] bg-[#F5F4F0]">
-      <section className="relative m-4 overflow-hidden">
+    <main className="grid min-h-screen bg-[#F5F4F0] lg:grid-cols-[1fr_1fr]">
+      <section className="relative m-4 hidden overflow-hidden lg:block">
         <img
           src={image.store}
           alt="Juniper Cafe counter"
@@ -53,7 +53,7 @@ export default function Login({ onLogin }: { onLogin: (user: SessionUser) => voi
           </div>
         </div>
       </section>
-      <section className="flex items-center justify-center px-16">
+      <section className="flex items-center justify-center px-6 py-10 sm:px-16">
         <form className="w-full max-w-sm" onSubmit={submit} noValidate>
           <p className="text-xs font-bold uppercase tracking-[.16em] text-[#28695E]">
             Juniper Cafe POS

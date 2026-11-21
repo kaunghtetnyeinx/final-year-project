@@ -13,7 +13,9 @@ export type TableProps = {
 export default function Table({ headers, rows, empty = "No records found.", action, actionWidth = 76 }: TableProps) {
   const gridTemplateColumns = `repeat(${headers.length}, minmax(0, 1fr))${action ? ` ${actionWidth}px` : ""}`
   return (
-    <div className="mt-5 overflow-hidden rounded border border-[#DEDFDA] bg-white">
+    // Scrolls sideways on narrow screens (tablets in portrait) instead of squashing columns.
+    <div className="mt-5 overflow-x-auto rounded border border-[#DEDFDA] bg-white">
+      <div className="min-w-[720px]">
       <div
         className="grid bg-[#EEEDEA] px-5 py-3 text-[10px] font-bold uppercase tracking-[.1em] text-[#777C76]"
         style={{ gridTemplateColumns }}
@@ -56,6 +58,7 @@ export default function Table({ headers, rows, empty = "No records found.", acti
           {action && <div className="flex justify-end">{action(rowIndex)}</div>}
         </div>
       ))}
+      </div>
     </div>
   )
 }

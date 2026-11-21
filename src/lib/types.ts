@@ -1,7 +1,14 @@
-import { Bill, Rates } from "./billing"
+import type { Bill, Rates } from "./billing.ts"
 
 /** The signed-in account, as returned by the API (see server/src/auth.js publicUser). */
-export type SessionUser = { id: number; name: string; email: string; role: Role }
+export type SessionUser = {
+  id: number
+  name: string
+  email: string
+  role: Role
+  /** Still on the seeded or an admin-set temporary password: must choose a new one first. */
+  mustChangePassword: boolean
+}
 
 /** A user row from GET /api/users (see server/src/routes/admin.js toUser). */
 export type StaffUser = {
@@ -11,12 +18,25 @@ export type StaffUser = {
   email: string
   role: Role
   isActive: boolean
+  mustChangePassword: boolean
   createdAt: string
 }
 
 export type Role = "ADMIN" | "STAFF"
 
-export type View = "New sale" | "Transactions" | "Products" | "Recipes" | "Inventory" | "Stock movements" | "Forecasts" | "Users"
+export type View =
+  | "New sale"
+  | "Transactions"
+  | "Reports"
+  | "Products"
+  | "Recipes"
+  | "Inventory"
+  | "Stock movements"
+  | "Forecasts"
+  | "Users"
+
+/** An option such as "Large +RM 2.00" (GET /api/products, `options`). */
+export type ProductOption = { id: number; name: string; priceDelta: number }
 
 /** A row of `products` (GET /api/products). Ingredients are products too. */
 export type Product = {
@@ -29,13 +49,17 @@ export type Product = {
   costPrice: number
   stock: number
   reorder: number
+  /** false = made to order: no shelf count; selling it uses up its recipe's ingredients. */
+  trackStock: boolean
   image: string | null
   isActive: boolean
   /** ISO timestamp */
   updated: string
+  options: ProductOption[]
 }
 
-export type CartLine = { productId: number; quantity: number }
+/** One cart line: the same product with different options is a separate line. */
+export type CartLine = { productId: number; optionIds: number[]; quantity: number }
 
 export type Payment = "Cash" | "Card" | "QR"
 
@@ -45,7 +69,7 @@ export type Movement = {
   id: string
   productId: number
   product: string
-  type: "SALE" | "PURCHASE" | "ADJUSTMENT"
+  type: "SALE" | "PURCHASE" | "ADJUSTMENT" | "PRODUCTION" | "VOID"
   change: number
   source: string
   by: string
@@ -57,7 +81,9 @@ export type TransactionLine = {
   name: string
   sku: string
   quantity: number
+  /** Includes the option surcharges. */
   unitPrice: number
+  options: { name: string; priceDelta: number }[]
 }
 
 export type Transaction = Bill & {
@@ -68,9 +94,14 @@ export type Transaction = Bill & {
   by: string
   payment: Payment | null
   lines: TransactionLine[]
+  discountReason: string | null
+  cashReceived: number | null
+  voidedAt: Date | null
+  voidedBy: string | null
+  voidReason: string | null
 }
 
-export type Category = { id: number; name: string }
+export type Category = { id: number; name: string; description: string | null }
 
 export type Forecast = {
   productId: number
@@ -82,10 +113,36 @@ export type Forecast = {
   generatedAt: Date
 }
 
-// The API sends timestamps as ISO strings; these turn them into Dates.
-export type Wire<T, K extends keyof T> = Omit<T, K> & { [P in K]: string }
+/** GET /api/reports/daily */
+export type DailyReport = {
+  date: string
+  sales: {
+    count: number
+    subtotal: number
+    discount: number
+    serviceCharge: number
+    tax: number
+    rounding: number
+    total: number
+    averageSale: number
+  }
+  byPayment: { payment: Payment; count: number; total: number }[]
+  voided: { count: number; total: number }
+  topItems: { productId: number; name: string; quantity: number; revenue: number }[]
+  purchases: { count: number; total: number }
+  generatedAt: string
+}
 
-export const toTransaction = (tx: Wire<Transaction, "at">): Transaction => ({ ...tx, at: new Date(tx.at) })
+// The API sends timestamps as ISO strings; these turn them into Dates.
+export type Wire<T, K extends keyof T> = Omit<T, K> & { [P in K]: null extends T[P] ? string | null : string }
+/** A transaction as the API sends it. */
+export type TransactionWire = Wire<Transaction, "at" | "voidedAt">
+
+export const toTransaction = (tx: TransactionWire): Transaction => ({
+  ...tx,
+  at: new Date(tx.at),
+  voidedAt: tx.voidedAt ? new Date(tx.voidedAt) : null,
+})
 
 export const toMovement = (m: Wire<Movement, "created">): Movement => ({ ...m, created: new Date(m.created) })
 

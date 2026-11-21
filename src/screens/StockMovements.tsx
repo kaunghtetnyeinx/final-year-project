@@ -1,6 +1,6 @@
 import Heading from "../components/Heading"
 import Table from "../components/Table"
-import { myStamp } from "../lib/format"
+import { myStamp, qty } from "../lib/format"
 import { Movement } from "../lib/types"
 
 export default function StockMovements({ movements }: { movements: Movement[] }) {
@@ -8,13 +8,13 @@ export default function StockMovements({ movements }: { movements: Movement[] })
     m.id,
     m.product,
     m.type,
-    m.change > 0 ? `+${m.change}` : `−${Math.abs(m.change)}`,
+    m.change > 0 ? `+${qty(m.change)}` : `−${qty(Math.abs(m.change))}`,
     m.source,
     m.by,
     myStamp(m.created),
   ])
   return (
-    <div className="p-8">
+    <div className="p-4 sm:p-8">
       <Heading
         title="Stock movements"
         subtitle="Append-only inventory history. Every posted transaction line creates at most one movement."

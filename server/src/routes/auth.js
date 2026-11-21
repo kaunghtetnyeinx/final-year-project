@@ -1,8 +1,19 @@
 import { Router } from "express"
 import rateLimit from "express-rate-limit"
 import { z } from "zod"
-import { COOKIE_NAME, cookieOptions, publicUser, requireAuth, signSession, verifyLogin } from "../auth.js"
-import { ApiError, parse } from "../errors.js"
+import {
+  COOKIE_NAME,
+  checkPassword,
+  cookieOptions,
+  hashPassword,
+  passwordSchema,
+  publicUser,
+  requireAuth,
+  signSession,
+  verifyLogin,
+} from "../auth.js"
+import { pool } from "../db.js"
+import { ApiError, badRequest, parse } from "../errors.js"
 
 export const authRouter = Router()
 
@@ -36,4 +47,31 @@ authRouter.post("/logout", (_req, res) => {
 
 authRouter.get("/me", requireAuth, (req, res) => {
   res.json({ user: req.user })
+})
+
+const ChangePasswordBody = z.object({
+  currentPassword: z.string().min(1, "Enter your current password").max(200),
+  newPassword: passwordSchema,
+})
+
+// Password changes test the current password too, so they are rate limited per account.
+const changeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  keyGenerator: (req) => `user:${req.user.id}`,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Try again in 15 minutes." },
+})
+
+// Any signed-in user changes their own password (also clears "must change password").
+authRouter.post("/change-password", requireAuth, changeLimiter, async (req, res) => {
+  const { currentPassword, newPassword } = parse(ChangePasswordBody, req.body)
+  if (!(await checkPassword(req.user.id, currentPassword))) throw new ApiError(401, "Current password is wrong")
+  if (currentPassword === newPassword) throw badRequest("Choose a password different from the current one")
+  await pool.query("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", [
+    await hashPassword(newPassword),
+    req.user.id,
+  ])
+  res.json({ user: { ...req.user, mustChangePassword: false } })
 })

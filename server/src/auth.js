@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs"
 import jwt from "jsonwebtoken"
+import { z } from "zod"
 import { config } from "./config.js"
 import { pool } from "./db.js"
 import { ApiError } from "./errors.js"
@@ -17,10 +18,17 @@ export const cookieOptions = () => ({
 })
 
 const USER_SQL = `
-  SELECT u.id, u.name, u.email, u.password_hash, u.is_active, r.name AS role
+  SELECT u.id, u.name, u.email, u.password_hash, u.is_active, u.must_change_password, r.name AS role
   FROM users u JOIN roles r ON r.id = u.role_id`
 
-export const publicUser = (row) => ({ id: row.id, name: row.name, email: row.email, role: row.role })
+export const publicUser = (row) => ({
+  id: row.id,
+  name: row.name,
+  email: row.email,
+  role: row.role,
+  // The front end makes the user choose a new password before anything else.
+  mustChangePassword: Boolean(row.must_change_password),
+})
 
 /** Returns the user when email + password are right and the account is active, else null. */
 export async function verifyLogin(email, password) {
@@ -62,3 +70,16 @@ export function requireAdmin(req, _res, next) {
 }
 
 export const hashPassword = (password) => bcrypt.hash(password, 12)
+
+/** Re-checks a signed-in user's password (for changing it). */
+export async function checkPassword(userId, password) {
+  const [rows] = await pool.query("SELECT password_hash FROM users WHERE id = ?", [userId])
+  return Boolean(rows[0]) && (await bcrypt.compare(password, rows[0].password_hash))
+}
+
+/** One password rule for every place a password is set (the front end checks the same). */
+export const passwordSchema = z
+  .string()
+  .min(10, "Password must be at least 10 characters")
+  .max(200)
+  .refine((p) => /[A-Za-z]/.test(p) && /\d/.test(p), "Password needs letters and numbers")

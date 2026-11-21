@@ -1,4 +1,5 @@
 // All settings come from environment variables (see .env.example).
+import path from "node:path"
 const env = process.env
 
 function required(name) {
@@ -28,6 +29,8 @@ export const config = {
   cookieSecure: bool(env.COOKIE_SECURE, env.NODE_ENV === "production"),
   // Behind Caddy, trust one proxy hop so rate limiting sees the real client IP.
   trustProxy: bool(env.TRUST_PROXY, true),
+  // Uploaded product photos (a Docker volume in production).
+  uploadDir: path.resolve(env.UPLOAD_DIR ?? "uploads"),
   // Reserved for later: payment gateway webhook stays off until this is true.
   paymentsGatewayEnabled: bool(env.PAYMENTS_GATEWAY_ENABLED),
 }

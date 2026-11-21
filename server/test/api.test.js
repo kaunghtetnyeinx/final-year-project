@@ -6,6 +6,7 @@ import { after, before, describe, test } from "node:test"
 import { createApp } from "../src/app.js"
 import { saleBill } from "../src/billing.js"
 import { pool } from "../src/db.js"
+import { migrate } from "../src/migrate.js"
 
 let server
 let admin, staff
@@ -13,6 +14,8 @@ let base
 const PASSWORD = "Juniper@2026"
 
 before(async () => {
+  // The seed SQL is the starting point; migrations bring it to the current schema.
+  await migrate(pool, () => {})
   server = createApp().listen(0)
   await new Promise((resolve) => server.once("listening", resolve))
   base = `http://127.0.0.1:${server.address().port}/api`
@@ -47,9 +50,9 @@ describe("billing maths (same as the prototype)", () => {
   const rates = { serviceChargeRate: 0.1, sstRate: 0.06 }
   test("seeded sales reproduce", () => {
     assert.deepEqual(saleBill([{ unitPrice: 18, quantity: 2 }, { unitPrice: 6, quantity: 1 }], rates),
-      { subtotal: 42, serviceCharge: 4.2, tax: 2.52, rounding: -0.02, total: 48.7 })
+      { subtotal: 42, discount: 0, serviceCharge: 4.2, tax: 2.52, rounding: -0.02, total: 48.7 })
     assert.deepEqual(saleBill([{ unitPrice: 12, quantity: 2 }, { unitPrice: 11, quantity: 1 }, { unitPrice: 6.5, quantity: 2 }], rates),
-      { subtotal: 48, serviceCharge: 4.8, tax: 2.88, rounding: 0.02, total: 55.7 })
+      { subtotal: 48, discount: 0, serviceCharge: 4.8, tax: 2.88, rounding: 0.02, total: 55.7 })
   })
 })
 
@@ -229,6 +232,195 @@ describe("users (admin)", () => {
     assert.equal((await call("PATCH", "/users/1", { cookie: admin, body: { isActive: false } })).status, 400)
   })
 })
+
+describe("passwords", () => {
+  test("seeded accounts must choose a new password", async () => {
+    assert.equal((await call("GET", "/auth/me", { cookie: admin })).body.user.mustChangePassword, true)
+  })
+  test("admin-set password is temporary; user changes their own", async () => {
+    const created = await call("POST", "/users", { cookie: admin, body: { name: "Temp User", email: "pw@juniper.store", password: "TempPass2026" } })
+    assert.equal(created.status, 201, JSON.stringify(created.body))
+    assert.equal(created.body.user.mustChangePassword, true)
+    const signIn = await call("POST", "/auth/login", { body: { email: "pw@juniper.store", password: "TempPass2026" } })
+    assert.equal(signIn.body.user.mustChangePassword, true)
+    const cookie = signIn.setCookie.split(";")[0]
+    const change = (body) => call("POST", "/auth/change-password", { cookie, body })
+    assert.equal((await change({ currentPassword: "wrong-one-1", newPassword: "MyOwnPass2026" })).status, 401)
+    assert.equal((await change({ currentPassword: "TempPass2026", newPassword: "short" })).status, 400)
+    assert.equal((await change({ currentPassword: "TempPass2026", newPassword: "TempPass2026" })).status, 400)
+    const ok = await change({ currentPassword: "TempPass2026", newPassword: "MyOwnPass2026" })
+    assert.equal(ok.status, 200, JSON.stringify(ok.body))
+    assert.equal(ok.body.user.mustChangePassword, false)
+    assert.equal((await call("GET", "/auth/me", { cookie })).body.user.mustChangePassword, false)
+    await login("pw@juniper.store", "MyOwnPass2026")
+  })
+})
+
+describe("discounts, cash and options", () => {
+  test("discount comes off before service charge and SST; cash change recorded", async () => {
+    const res = await call("POST", "/sales", {
+      cookie: staff,
+      body: { requestId: randomUUID(), payment: "Cash", discount: 1, discountReason: "Loyalty", cashReceived: 20, lines: [{ productId: 4, quantity: 1 }] },
+    })
+    assert.equal(res.status, 201, JSON.stringify(res.body))
+    const sale = res.body.sale
+    assert.deepEqual([sale.subtotal, sale.discount, sale.serviceCharge, sale.tax, sale.total], [11, 1, 1, 0.6, 11.6])
+    assert.equal(sale.discountReason, "Loyalty")
+    assert.equal(sale.cashReceived, 20)
+  })
+  test("discount needs a reason; cash cannot be short", async () => {
+    const sell = (extra) => call("POST", "/sales", { cookie: staff, body: { requestId: randomUUID(), payment: "Cash", lines: [{ productId: 4, quantity: 1 }], ...extra } })
+    assert.equal((await sell({ discount: 2 })).status, 400)
+    assert.match((await sell({ cashReceived: 1 })).body.error, /less than the total/)
+  })
+})
+
+describe("made-to-order products, recipes and voids", () => {
+  let latte, large
+  test("admin adds a made-to-order drink with options", async () => {
+    const created = await call("POST", "/products", { cookie: admin, body: { name: "Cafe Latte", sku: "CAF-101", category: "Coffee", price: 9.5, trackStock: false } })
+    assert.equal(created.status, 201, JSON.stringify(created.body))
+    latte = created.body.product
+    assert.equal(latte.trackStock, false)
+    const withOptions = await call("PUT", `/products/${latte.id}/options`, {
+      cookie: admin,
+      body: { options: [{ name: "Large", priceDelta: 2 }, { name: "Oat milk", priceDelta: 1.5 }] },
+    })
+    assert.equal(withOptions.status, 200, JSON.stringify(withOptions.body))
+    large = withOptions.body.product.options.find((o) => o.name === "Large")
+    assert.equal(withOptions.body.product.options.length, 2)
+    const recipe = await call("POST", "/recipes", { cookie: admin, body: { productId: latte.id, ingredientId: 101, quantityRequired: 18, unit: "g" } })
+    assert.equal(recipe.status, 201, JSON.stringify(recipe.body))
+  })
+
+  let saleNumber
+  test("selling it uses up ingredients, not its own stock; options add to the price", async () => {
+    const beans = await stockOf(101)
+    const res = await call("POST", "/sales", {
+      cookie: staff,
+      body: { requestId: randomUUID(), payment: "Card", lines: [{ productId: latte.id, quantity: 2, optionIds: [large.id] }, { productId: latte.id, quantity: 1 }] },
+    })
+    assert.equal(res.status, 201, JSON.stringify(res.body))
+    saleNumber = res.body.sale.number
+    const lines = res.body.sale.lines
+    assert.equal(lines.length, 2, "different options are separate lines")
+    assert.equal(lines.find((l) => l.options.length).unitPrice, 11.5)
+    assert.deepEqual(lines.find((l) => l.options.length).options, [{ name: "Large", priceDelta: 2 }])
+    assert.equal(res.body.sale.subtotal, 32.5)
+    assert.equal(await stockOf(101), beans - 54)
+    assert.equal(await stockOf(latte.id), 0)
+    const [moves] = await pool.query("SELECT product_id, quantity_change FROM stock_movements WHERE reference = ?", [saleNumber])
+    assert.deepEqual(moves.map((m) => [m.product_id, m.quantity_change]), [[101, -54]])
+  })
+
+  test("not enough of an ingredient blocks the sale; wrong option is rejected", async () => {
+    const big = await call("POST", "/sales", { cookie: staff, body: { requestId: randomUUID(), payment: "Cash", lines: [{ productId: latte.id, quantity: 999 }] } })
+    assert.equal(big.status, 409)
+    assert.match(big.body.error, /Not enough Arabica Coffee Beans/)
+    const wrong = await call("POST", "/sales", { cookie: staff, body: { requestId: randomUUID(), payment: "Cash", lines: [{ productId: 1, quantity: 1, optionIds: [large.id] }] } })
+    assert.equal(wrong.status, 400)
+  })
+
+  test("made-to-order items cannot be purchased or adjusted", async () => {
+    assert.equal((await call("POST", "/purchases", { cookie: admin, body: { productId: latte.id, quantity: 1, unitCost: 1 } })).status, 400)
+    assert.equal((await call("POST", "/inventory/adjustments", { cookie: admin, body: { productId: latte.id, change: 1, reason: "x" } })).status, 400)
+  })
+
+  test("voiding a sale puts the stock back and keeps the record", async () => {
+    assert.equal((await call("POST", `/sales/${saleNumber}/void`, { cookie: staff, body: { reason: "Wrong order" } })).status, 403)
+    assert.equal((await call("POST", `/sales/${saleNumber}/void`, { cookie: admin, body: { reason: "" } })).status, 400)
+    const beans = await stockOf(101)
+    const res = await call("POST", `/sales/${saleNumber}/void`, { cookie: admin, body: { reason: "Wrong order" } })
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+    assert.equal(res.body.transaction.status, "CANCELLED")
+    assert.equal(res.body.transaction.voidReason, "Wrong order")
+    assert.equal(res.body.transaction.voidedBy, "Kaung Htet Nyein")
+    assert.equal(await stockOf(101), beans + 54)
+    const [moves] = await pool.query("SELECT movement_type, quantity_change FROM stock_movements WHERE reference = ? AND movement_type = 'VOID'", [saleNumber])
+    assert.deepEqual(moves.map((m) => m.quantity_change), [54])
+    assert.equal((await call("POST", `/sales/${saleNumber}/void`, { cookie: admin, body: { reason: "again" } })).status, 409)
+  })
+})
+
+describe("production, drafts and decimals (admin)", () => {
+  test("a batch adds finished stock and uses up the recipe", async () => {
+    const [croissant, flour, eggs] = [await stockOf(2), await stockOf(103), await stockOf(105)]
+    const res = await call("POST", "/inventory/production", { cookie: admin, body: { productId: 2, quantity: 10 } })
+    assert.equal(res.status, 201, JSON.stringify(res.body))
+    assert.equal(await stockOf(2), croissant + 10)
+    assert.equal(await stockOf(103), flour - 600)
+    assert.equal(await stockOf(105), eggs - 2)
+    assert.equal((await call("POST", "/inventory/production", { cookie: admin, body: { productId: 4, quantity: 1 } })).status, 400, "no recipe")
+  })
+  test("ingredient adjustments can use decimals", async () => {
+    const start = await stockOf(103)
+    const res = await call("POST", "/inventory/adjustments", { cookie: admin, body: { productId: 103, change: -12.5, reason: "Spilled" } })
+    assert.equal(res.status, 201, JSON.stringify(res.body))
+    assert.equal(await stockOf(103), start - 12.5)
+  })
+  test("post a draft purchase; cancel another", async () => {
+    const start = await stockOf(1)
+    const posted = await call("POST", "/purchases/PO-0039/post", { cookie: admin })
+    assert.equal(posted.status, 200, JSON.stringify(posted.body))
+    assert.equal(posted.body.transaction.status, "POSTED")
+    assert.equal(await stockOf(1), start + 12)
+    assert.equal((await call("POST", "/purchases/PO-0039/post", { cookie: admin })).status, 409)
+    const draft = await call("POST", "/purchases", { cookie: admin, body: { productId: 4, quantity: 3, unitCost: 5, status: "DRAFT" } })
+    const cancelled = await call("POST", `/purchases/${draft.body.transaction.number}/cancel`, { cookie: admin, body: { reason: "Supplier out of stock" } })
+    assert.equal(cancelled.body.transaction.status, "CANCELLED")
+    assert.equal((await call("POST", "/purchases/SL-1045/cancel", { cookie: admin })).status, 404)
+  })
+})
+
+describe("categories, photos, reports, forecasts", () => {
+  test("admin adds and renames a category; Ingredients is protected", async () => {
+    const created = await call("POST", "/categories", { cookie: admin, body: { name: "Desserts" } })
+    assert.equal(created.status, 201, JSON.stringify(created.body))
+    assert.equal((await call("POST", "/categories", { cookie: admin, body: { name: "desserts" } })).status, 409)
+    assert.equal((await call("PATCH", `/categories/${created.body.category.id}`, { cookie: admin, body: { name: "Sweets" } })).status, 200)
+    const [[ingredients]] = await pool.query("SELECT id FROM categories WHERE name = 'Ingredients'")
+    assert.equal((await call("PATCH", `/categories/${ingredients.id}`, { cookie: admin, body: { name: "Raw" } })).status, 400)
+    assert.equal((await call("POST", "/categories", { cookie: staff, body: { name: "X" } })).status, 403)
+  })
+  test("photo upload checks the file type and serves the image", async () => {
+    const upload = (bytes) =>
+      fetch(`${base}/products/1/image`, { method: "POST", headers: { cookie: admin, "content-type": "image/png" }, body: bytes })
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 1)])
+    const res = await upload(png)
+    assert.equal(res.status, 201)
+    const { product } = await res.json()
+    assert.match(product.image, /^\/api\/uploads\/[a-f0-9]{32}\.png$/)
+    const served = await fetch(base.replace(/\/api$/, "") + product.image)
+    assert.equal(served.status, 200)
+    assert.equal((await upload(Buffer.from("not an image at all"))).status, 400)
+  })
+  test("transactions can be filtered to one Malaysian day", async () => {
+    const res = await call("GET", "/transactions?date=2026-06-18", { cookie: staff })
+    assert.deepEqual(res.body.transactions.map((t) => t.number).sort(), ["PO-0038", "SL-1046", "SL-1047"])
+  })
+  test("daily report adds up today's posted sales", async () => {
+    const res = await call("GET", "/reports/daily", { cookie: staff })
+    assert.equal(res.status, 200, JSON.stringify(res.body))
+    const { report } = res.body
+    assert.ok(report.sales.count >= 3)
+    assert.equal(report.byPayment.length, 3)
+    assert.equal(round(report.byPayment.reduce((s, p) => s + p.total, 0)), round(report.sales.total))
+    assert.ok(report.voided.count >= 1)
+    const june = await call("GET", "/reports/daily?date=2026-06-18", { cookie: staff })
+    assert.equal(june.body.report.sales.total, 74.8)
+  })
+  test("forecast job writes a moving average per product", async () => {
+    const run = await call("POST", "/forecasts/run", { cookie: admin })
+    assert.equal(run.status, 201, JSON.stringify(run.body))
+    assert.ok(run.body.generated > 0)
+    const res = await call("GET", "/forecasts", { cookie: admin })
+    const beans = res.body.forecasts.find((f) => f.sku === "CAF-001")
+    assert.equal(beans.model, "moving_average")
+    assert.equal(beans.horizonDays, 7)
+  })
+})
+
+const round = (n) => Math.round(n * 100) / 100
 
 describe("reserved for later", () => {
   test("payment webhook is off", async () => {

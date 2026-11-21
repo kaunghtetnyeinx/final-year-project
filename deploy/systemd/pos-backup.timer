@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Juniper POS backup every night at 03:00 Malaysia time
+
+[Timer]
+# 19:00 UTC = 03:00 MYT. Persistent: if the server was off at 03:00, run at next boot.
+OnCalendar=*-*-* 19:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

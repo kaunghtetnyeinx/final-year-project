@@ -1,3 +1,4 @@
+import { mkdirSync } from "node:fs"
 import cookieParser from "cookie-parser"
 import express from "express"
 import helmet from "helmet"
@@ -11,6 +12,7 @@ import { catalogueRouter } from "./routes/catalogue.js"
 import { inventoryRouter } from "./routes/inventory.js"
 import { paymentsRouter } from "./routes/payments.js"
 import { recipesRouter } from "./routes/recipes.js"
+import { reportsRouter } from "./routes/reports.js"
 import { transactionsRouter } from "./routes/transactions.js"
 
 export function createApp() {
@@ -29,12 +31,19 @@ export function createApp() {
     res.json({ ok: true })
   })
   api.use("/auth", authRouter)
+  // Product photos are public (they are only product pictures) and never change once written.
+  mkdirSync(config.uploadDir, { recursive: true })
+  api.use(
+    "/uploads",
+    express.static(config.uploadDir, { immutable: true, maxAge: "365d", index: false, dotfiles: "deny", fallthrough: false }),
+  )
   api.use(paymentsRouter)
 
   // Signed in: Admin and Staff (sale screen, transactions, product list)
   api.use(requireAuth)
   api.use(catalogueRouter)
   api.use(transactionsRouter)
+  api.use(reportsRouter)
 
   // Admin only: everything below this line
   api.use(requireAdmin)

@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { z } from "zod"
-import { hashPassword } from "../auth.js"
+import { hashPassword, passwordSchema } from "../auth.js"
+import { runForecast } from "../forecast.js"
 import { pool } from "../db.js"
 import { badRequest, conflict, notFound, parse } from "../errors.js"
 import { isDuplicate } from "../ledger.js"
@@ -17,9 +18,10 @@ const toUser = (r) => ({
   email: r.email,
   role: r.role,
   isActive: Boolean(r.is_active),
+  mustChangePassword: Boolean(r.must_change_password),
   createdAt: r.created_at.toISOString(),
 })
-const USERS_SQL = `SELECT u.id, u.name, u.email, u.is_active, u.created_at, r.name AS role
+const USERS_SQL = `SELECT u.id, u.name, u.email, u.is_active, u.must_change_password, u.created_at, r.name AS role
                    FROM users u JOIN roles r ON r.id = u.role_id`
 
 adminRouter.get("/users", async (_req, res) => {
@@ -27,11 +29,7 @@ adminRouter.get("/users", async (_req, res) => {
   res.json({ users: rows.map(toUser) })
 })
 
-const password = z
-  .string()
-  .min(10, "Password must be at least 10 characters")
-  .max(200)
-  .refine((p) => /[A-Za-z]/.test(p) && /\d/.test(p), "Password needs letters and numbers")
+const password = passwordSchema
 
 const CreateUser = z.object({
   name: z.string().trim().min(1, "Full name is required.").max(100),
@@ -45,8 +43,8 @@ adminRouter.post("/users", async (req, res) => {
   const body = parse(CreateUser, req.body)
   try {
     const [result] = await pool.query(
-      `INSERT INTO users (name, email, password_hash, role_id)
-       VALUES (?, ?, ?, (SELECT id FROM roles WHERE name = ?))`,
+      `INSERT INTO users (name, email, password_hash, role_id, must_change_password)
+       VALUES (?, ?, ?, (SELECT id FROM roles WHERE name = ?), 1)`,
       [body.name, body.email, await hashPassword(body.password), body.role],
     )
     const [rows] = await pool.query(`${USERS_SQL} WHERE u.id = ?`, [result.insertId])
@@ -72,7 +70,11 @@ adminRouter.patch("/users/:id", async (req, res) => {
   const params = []
   if (body.role) sets.push("role_id = (SELECT id FROM roles WHERE name = ?)"), params.push(body.role)
   if (body.isActive !== undefined) sets.push("is_active = ?"), params.push(body.isActive)
-  if (body.password) sets.push("password_hash = ?"), params.push(await hashPassword(body.password))
+  if (body.password) {
+    sets.push("password_hash = ?"), params.push(await hashPassword(body.password))
+    // A password set by an admin is temporary: the user picks their own at next sign-in.
+    sets.push("must_change_password = ?"), params.push(id !== req.user.id)
+  }
   const [result] = await pool.query(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`, [...params, id])
   if (!result.affectedRows) throw notFound("User not found")
   const [rows] = await pool.query(`${USERS_SQL} WHERE u.id = ?`, [id])
@@ -93,14 +95,18 @@ adminRouter.put("/settings/target-margin", async (req, res) => {
 })
 
 // ---------------------------------------------------------------- forecasts
-// Latest forecast per product. Today these are the seeded demo values; later the forecast
-// job writes new rows into forecast_results and this endpoint returns them unchanged.
+// Latest forecast per product. The forecast job (src/forecast.js) writes new rows daily;
+// POST /forecasts/run runs it now.
+adminRouter.post("/forecasts/run", async (_req, res) => {
+  res.status(201).json(await runForecast())
+})
+
 adminRouter.get("/forecasts", async (_req, res) => {
   const [rows] = await pool.query(
     `SELECT f.product_id, p.sku, p.name, p.stock_quantity, p.reorder_level, f.forecast_date, f.horizon_days,
             f.predicted_quantity, f.model_name, f.model_version, f.generated_at
      FROM forecast_results f JOIN products p ON p.id = f.product_id
-     WHERE f.id = (SELECT f2.id FROM forecast_results f2 WHERE f2.product_id = f.product_id
+     WHERE p.is_active = 1 AND f.id = (SELECT f2.id FROM forecast_results f2 WHERE f2.product_id = f.product_id
                    ORDER BY f2.generated_at DESC, f2.id DESC LIMIT 1)
      ORDER BY p.id`,
   )

@@ -8,19 +8,25 @@ export const round4 = (value) => Math.round((value + Number.EPSILON) * 10000) / 
 // Malaysia's rounding mechanism: total bill to the nearest 5 sen.
 export const roundTo5Sen = (value) => round2(Math.round(round2(value) * 20) / 20)
 
-/** @param {{quantity:number, unitPrice:number}[]} lines */
-export function saleBill(lines, { serviceChargeRate, sstRate }) {
+/**
+ * A bill discount (RM) comes off the item subtotal first; service charge and SST are then
+ * charged on what is left. It can never exceed the subtotal.
+ * @param {{quantity:number, unitPrice:number}[]} lines
+ */
+export function saleBill(lines, { serviceChargeRate, sstRate }, discountAmount = 0) {
   const subtotal = round2(lines.reduce((sum, l) => sum + l.unitPrice * l.quantity, 0))
-  const serviceCharge = round2(subtotal * serviceChargeRate)
-  // SST is charged on the subtotal, excluding the service charge.
-  const tax = round2(subtotal * sstRate)
-  const exact = round2(subtotal + serviceCharge + tax)
+  const discount = round2(Math.min(Math.max(discountAmount, 0), subtotal))
+  const net = round2(subtotal - discount)
+  const serviceCharge = round2(net * serviceChargeRate)
+  // SST is charged on the (discounted) subtotal, excluding the service charge.
+  const tax = round2(net * sstRate)
+  const exact = round2(net + serviceCharge + tax)
   const total = roundTo5Sen(exact)
-  return { subtotal, serviceCharge, tax, rounding: round2(total - exact), total }
+  return { subtotal, discount, serviceCharge, tax, rounding: round2(total - exact), total }
 }
 
 // Supplier purchases are recorded at cost: no service charge, SST or rounding.
 export function purchaseBill(lines) {
   const subtotal = round2(lines.reduce((sum, l) => sum + l.unitPrice * l.quantity, 0))
-  return { subtotal, serviceCharge: 0, tax: 0, rounding: 0, total: subtotal }
+  return { subtotal, discount: 0, serviceCharge: 0, tax: 0, rounding: 0, total: subtotal }
 }

@@ -32,6 +32,14 @@ export function errorHandler(error, req, res, _next) {
   if (error instanceof ZodError) {
     return res.status(400).json({ error: "Invalid request", details: error.issues })
   }
+  // Errors from Express itself (e.g. 404 for a missing uploaded file) carry their own status.
+  if (error?.status === 404) return res.status(404).json({ error: "Not found" })
+  if (error?.expose && error.status >= 400 && error.status < 500 && error.type !== "entity.too.large") {
+    return res.status(error.status).json({ error: error.message })
+  }
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({ error: "That file or request is too large." })
+  }
   if (error?.type === "entity.parse.failed") {
     return res.status(400).json({ error: "Request body is not valid JSON" })
   }

@@ -1,9 +1,11 @@
 name: CI
 
+# Every branch is checked, so a branch can be proven green before it is merged.
+# The server's auto-deploy (deploy/auto-deploy.sh) only deploys a main commit whose
+# checks here have all passed.
 on:
   pull_request:
   push:
-    branches: [main]
 
 jobs:
   build:
@@ -17,6 +19,8 @@ jobs:
       - run: npm ci
       - name: Type-check
         run: npx tsc --noEmit -p .
+      - name: Unit tests
+        run: npm test
       - name: Build
         run: npm run build
       - name: Docker image builds
@@ -45,6 +49,7 @@ jobs:
       DB_NAME: project_poin
       JWT_SECRET: ci-only-secret-ci-only-secret-ci-only-secret
       COOKIE_SECURE: "false"
+      UPLOAD_DIR: /tmp/pos-uploads
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -55,7 +60,13 @@ jobs:
       - run: npm ci
       - name: Load schema + seed data
         run: mysql -h 127.0.0.1 -uroot -proot project_poin < ../database/project_poin_seeded.sql
+      - name: Migrations apply cleanly (and a second run is a no-op)
+        run: node src/migrate-cli.js && node src/migrate-cli.js
       - name: API tests
-        run: node --test --test-concurrency=1 test/*.test.js
+        run: >-
+          node --test --test-concurrency=1
+          --test-reporter=spec --test-reporter-destination=stdout
+          --test-reporter=./test/gh-annotations.js --test-reporter-destination=stdout
+          test/*.test.js
       - name: Docker image builds
         run: docker build -t juniper-pos-api:ci .

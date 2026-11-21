@@ -4,10 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Juniper Cafe POS back-end API (Express + MariaDB)",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch --env-file=.env src/index.js",
+    "migrate": "node --env-file-if-exists=.env src/migrate-cli.js",
     "test": "node --env-file=.env.test --test --test-concurrency=1 test/*.test.js"
   },
   "dependencies": {

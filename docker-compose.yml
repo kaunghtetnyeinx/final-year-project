@@ -21,11 +21,34 @@ services:
     restart: unless-stopped
     expose: ["8080"]
 
+  # One-off: applies database schema migrations (server/src/migrate.js), then exits.
+  # Uses the database admin login: the API's own user may only read and write rows.
+  pos-migrate:
+    build: ./server
+    image: juniper-pos-api:latest
+    command: ["node", "src/migrate-cli.js"]
+    restart: "no"
+    healthcheck:
+      disable: true
+    environment:
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in .env}
+      DB_NAME: project_poin
+      DB_SSL: "false"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
   pos-api:
     build: ./server
     image: juniper-pos-api:latest
     restart: unless-stopped
     expose: ["3000"]
+    volumes:
+      # Uploaded product photos survive rebuilds (deploy/backup.sh copies them too).
+      - uploads:/app/uploads
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -38,9 +61,13 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       COOKIE_SECURE: "true"
       PAYMENTS_GATEWAY_ENABLED: "false"   # reserved for later
+      UPLOAD_DIR: /app/uploads
     depends_on:
       mariadb:
         condition: service_healthy
+      # The API refuses to start on an out-of-date schema, so migrations go first.
+      pos-migrate:
+        condition: service_completed_successfully
 
   mariadb:
     image: mariadb:10.11
@@ -72,5 +99,6 @@ services:
 
 volumes:
   db_data:
+  uploads:
   caddy_data:
   caddy_config:

@@ -1,0 +1,10 @@
+[Unit]
+Description=Juniper POS nightly backup (database + uploaded photos)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/final-year-project
+ExecStart=/bin/bash /home/ubuntu/final-year-project/deploy/backup.sh
+TimeoutStartSec=30min

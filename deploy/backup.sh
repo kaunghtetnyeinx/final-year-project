@@ -1,7 +1,7 @@
 #!/bin/bash
 # Nightly database backup. Keeps 14 days on the server; also copies to S3 if S3_BUCKET is set.
 # Install (once):  sudo crontab -e   then add:
-#   0 19 * * * /home/ubuntu/Juniper-Cafe-POS/deploy/backup.sh >> /var/log/pos-backup.log 2>&1
+#   0 19 * * * /bin/bash /home/ubuntu/final-year-project/deploy/backup.sh >> /var/log/pos-backup.log 2>&1
 #   (19:00 UTC = 03:00 Malaysia time)
 set -euo pipefail
 cd "$(dirname "$0")/.."

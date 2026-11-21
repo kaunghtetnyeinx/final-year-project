@@ -1,0 +1,23 @@
+{
+  "name": "juniper-pos-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Juniper Cafe POS back-end API (Express + MariaDB)",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch --env-file=.env src/index.js",
+    "test": "node --env-file=.env.test --test --test-concurrency=1 test/*.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.14.0",
+    "zod": "^4.0.0"
+  }
+}

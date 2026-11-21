@@ -1,0 +1,76 @@
+# Production on ONE EC2 server (Singapore). Settings come from .env next to this file.
+#   Internet -> Caddy (HTTPS, 80/443) -> /api/* -> pos-api (Node, 3000)  -> mariadb (3306)
+#                                     -> other  -> pos-web (nginx, 8080)
+# Only Caddy is reachable from outside; the API and database are on the internal network.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [pos-web, pos-api]
+
+  pos-web:
+    build: .
+    image: juniper-pos-web:latest
+    restart: unless-stopped
+    expose: ["8080"]
+
+  pos-api:
+    build: ./server
+    image: juniper-pos-api:latest
+    restart: unless-stopped
+    expose: ["3000"]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_USER: pos_app
+      DB_PASSWORD: ${POS_APP_DB_PASSWORD:?Set POS_APP_DB_PASSWORD in .env}
+      DB_NAME: project_poin
+      DB_SSL: "false"          # internal Docker network, never leaves the server
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      COOKIE_SECURE: "true"
+      PAYMENTS_GATEWAY_ENABLED: "false"   # reserved for later
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  mariadb:
+    image: mariadb:10.11
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: project_poin
+      POS_APP_DB_PASSWORD: ${POS_APP_DB_PASSWORD}
+      TZ: UTC
+    # Small server (2 GB RAM): keep MariaDB's memory modest.
+    command: ["--innodb-buffer-pool-size=256M", "--max-connections=50", "--default-time-zone=+00:00"]
+    volumes:
+      - db_data:/var/lib/mysql
+      # First start only (empty volume): schema + seed data, then the limited API user.
+      - ./deploy/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    # No "ports:" on purpose: the database is not reachable from the internet.
+
+  # Later: forecast job (writes to forecast_results; API and screens need no change)
+  # forecast:
+  #   build: ./forecast
+  #   environment:
+  #     DB_HOST: mariadb
+  #   restart: "no"
+
+volumes:
+  db_data:
+  caddy_data:
+  caddy_config:

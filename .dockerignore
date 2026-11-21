@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+*.log
+.env*
+# note: .figma/make/site.json is imported by vite.config.ts, so .figma must stay in the build context
+**/node_modules
+server
+database

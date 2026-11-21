@@ -1,0 +1,13 @@
+# SITE_ADDRESS comes from the .env file next to docker-compose.yml,
+# e.g. 13.212.45.67.sslip.io  (free hostname that points at your server IP).
+# Caddy gets and renews the HTTPS certificate automatically.
+{$SITE_ADDRESS} {
+    encode gzip
+    handle /api/* {
+        reverse_proxy pos-api:3000
+    }
+    handle {
+        reverse_proxy pos-web:8080
+    }
+    header Strict-Transport-Security "max-age=31536000"
+}

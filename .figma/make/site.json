@@ -1,0 +1,10 @@
+{
+  "description": "A simple POS system prototype designed for AL implementation testing, enabling efficient sales processing and showcasing core functionalities for evaluation.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

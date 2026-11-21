@@ -1,6 +1,8 @@
-# Juniper Cafe POS (prototype)
+# Juniper Cafe POS
 
-React 19 + Vite + Tailwind CSS v4. All data is in memory: it resets when the page reloads.
+React 19 + Vite + Tailwind CSS v4 front end. All data lives in MariaDB and goes through
+the API in `server/`: products, sales, purchases, stock, recipes, forecasts and users are
+saved there and shared by every till. The front end needs the API running (see Sign-in).
 
 ## Requirements
 
@@ -42,8 +44,11 @@ signed out on its next request.
 
 ## Main features
 
-- New sale: Cash / Card / QR, 10% service charge, 6% SST, rounding to the nearest 5 sen
+- New sale: Cash / Card / QR, service charge and SST from the `settings` table (10% / 6%),
+  rounding to the nearest 5 sen. The server recalculates every total from database prices.
 - Receipts: shown after Confirm and printable from any row in Transactions
 - Recipes: ingredient costing, target profit margin check and suggestions
+- Products (admin): add items, edit name, price, reorder level, image, and deactivate
 - Inventory, stock movements, forecasts and users (admin)
+- Every screen reloads from the database when you open it, so all tills stay in step
 - Times are in Malaysia Time (UTC+8)

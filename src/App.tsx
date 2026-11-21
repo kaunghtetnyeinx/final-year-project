@@ -1,5 +1,7 @@
 import {
+  useCallback,
   useEffect,
+  useRef,
   useState,
   type Dispatch,
   type FormEvent,
@@ -50,8 +52,12 @@ const myDateTime = (date: Date) => {
 
 // Every sale bill carries a service charge and SST, both calculated on the
 // item subtotal. Each amount is rounded to the sen so the receipt adds up exactly.
-const SERVICE_CHARGE_RATE = 0.1
-const SST_RATE = 0.06
+// The rates come from the `settings` table (GET /api/settings); the server
+// recalculates every bill itself, so this copy is only for the on-screen preview.
+type Rates = { serviceChargeRate: number; sstRate: number }
+const DEFAULT_RATES: Rates = { serviceChargeRate: 0.1, sstRate: 0.06 }
+/** 0.1 -> "10", 0.06 -> "6" */
+const ratePct = (rate: number) => String(Number((rate * 100).toFixed(2)))
 const round2 = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100
 type Bill = {
   subtotal: number
@@ -66,12 +72,12 @@ type Bill = {
 // Malaysia's rounding mechanism:
 // x.x1/x.x2 -> x.x0, x.x3/x.x4 -> x.x5, x.x6/x.x7 -> x.x5, x.x8/x.x9 -> next x.x0.
 const roundTo5Sen = (value: number) => round2(Math.round(round2(value) * 20) / 20)
-const saleBill = (lines: { quantity: number; unitPrice: number }[]): Bill => {
+const saleBill = (lines: { quantity: number; unitPrice: number }[], rates: Rates): Bill => {
   const subtotal = round2(
     lines.reduce((sum, line) => sum + line.unitPrice * line.quantity, 0),
   )
-  const serviceCharge = round2(subtotal * SERVICE_CHARGE_RATE)
-  const tax = round2(subtotal * SST_RATE)
+  const serviceCharge = round2(subtotal * rates.serviceChargeRate)
+  const tax = round2(subtotal * rates.sstRate)
   const exact = round2(subtotal + serviceCharge + tax)
   const total = roundTo5Sen(exact)
   return { subtotal, serviceCharge, tax, rounding: round2(total - exact), total }
@@ -79,13 +85,6 @@ const saleBill = (lines: { quantity: number; unitPrice: number }[]): Bill => {
 /** "+RM 0.01" / "-RM 0.02" / "RM 0.00" */
 const signedMoney = (value: number) =>
   value === 0 ? money(0) : `${value > 0 ? "+" : "-"}${money(Math.abs(value))}`
-// Supplier purchases are recorded at cost, with no service charge or SST.
-const purchaseBill = (lines: { quantity: number; unitPrice: number }[]): Bill => {
-  const subtotal = round2(
-    lines.reduce((sum, line) => sum + line.unitPrice * line.quantity, 0),
-  )
-  return { subtotal, serviceCharge: 0, tax: 0, rounding: 0, total: subtotal }
-}
 
 /** The signed-in account, as returned by the API (see server/src/auth.js publicUser). */
 type SessionUser = { id: number; name: string; email: string; role: Role }
@@ -100,6 +99,9 @@ type StaffUser = {
   isActive: boolean
   createdAt: string
 }
+
+/** Called when a request gets 401 (session expired or account disabled); App sets it. */
+let onSessionLost = () => {}
 
 /**
  * Calls the POS API. The session lives in an httpOnly cookie, so the browser
@@ -121,6 +123,8 @@ async function api<T>(path: string, options: { method?: string; body?: unknown }
   if (response.status === 204) return undefined as T
   const data = await response.json().catch(() => ({}))
   if (!response.ok) {
+    // A wrong password on the login form is also a 401, but that is not a lost session.
+    if (response.status === 401 && !path.startsWith("/auth/")) onSessionLost()
     // Validation errors carry field messages in details; show the first one.
     const detail = Array.isArray(data.details) ? data.details[0]?.message : undefined
     throw new Error(
@@ -136,30 +140,37 @@ async function api<T>(path: string, options: { method?: string; body?: unknown }
 
 type Role = "ADMIN" | "STAFF"
 type View = "New sale" | "Transactions" | "Products" | "Recipes" | "Inventory" | "Stock movements" | "Forecasts" | "Users"
+/** A row of `products` (GET /api/products). Ingredients are products too. */
 type Product = {
   id: number
   sku: string
   name: string
   category: string
   price: number
+  /** Latest posted purchase cost per unit (4 decimals); 0 = never purchased. */
+  costPrice: number
   stock: number
   reorder: number
-  image: string
-  updated?: string
+  image: string | null
+  isActive: boolean
+  /** ISO timestamp */
+  updated: string
 }
-type CartLine = Product & { quantity: number }
+type CartLine = { productId: number; quantity: number }
 type Payment = "Cash" | "Card" | "QR"
 const payments: Payment[] = ["Cash", "Card", "QR"]
 type Movement = {
   id: string
+  productId: number
   product: string
   type: "SALE" | "PURCHASE" | "ADJUSTMENT"
   change: number
   source: string
   by: string
-  created: string
+  created: Date
 }
 type TransactionLine = {
+  productId: number
   name: string
   sku: string
   quantity: number
@@ -174,6 +185,30 @@ type Transaction = Bill & {
   payment: Payment | null
   lines: TransactionLine[]
 }
+type Category = { id: number; name: string }
+type Forecast = {
+  productId: number
+  predicted: number
+  horizonDays: number
+  forecastDate: string
+  model: string
+  modelVersion: string | null
+  generatedAt: Date
+}
+
+// The API sends timestamps as ISO strings; these turn them into Dates.
+type Wire<T, K extends keyof T> = Omit<T, K> & { [P in K]: string }
+const toTransaction = (tx: Wire<Transaction, "at">): Transaction => ({ ...tx, at: new Date(tx.at) })
+const toMovement = (m: Wire<Movement, "created">): Movement => ({ ...m, created: new Date(m.created) })
+const toRecipe = (r: Wire<RecipeLine, "createdAt" | "updatedAt">): RecipeLine => ({
+  ...r,
+  createdAt: new Date(r.createdAt),
+  updatedAt: new Date(r.updatedAt),
+})
+const toForecast = (f: Wire<Forecast, "generatedAt">): Forecast => ({
+  ...f,
+  generatedAt: new Date(f.generatedAt),
+})
 
 const image = {
   coffee:
@@ -187,118 +222,9 @@ const image = {
   store:
     "https://images.unsplash.com/photo-1528699633788-424224dc89b5?auto=format&fit=crop&w=1400&q=85",
 }
-
-const products: Product[] = [
-  {
-    id: 1,
-    sku: "CAF-001",
-    name: "House Roast Beans",
-    category: "Coffee",
-    price: 18,
-    stock: 24,
-    reorder: 10,
-    image: image.coffee,
-  },
-  {
-    id: 2,
-    sku: "BAK-014",
-    name: "Butter Croissant",
-    category: "Bakery",
-    price: 4.5,
-    stock: 8,
-    reorder: 10,
-    image: image.bakery,
-  },
-  {
-    id: 3,
-    sku: "MEA-008",
-    name: "Chicken Grain Bowl",
-    category: "Ready meals",
-    price: 13.5,
-    stock: 12,
-    reorder: 6,
-    image: image.meal,
-  },
-  {
-    id: 4,
-    sku: "PAN-021",
-    name: "Juniper Granola",
-    category: "Pantry",
-    price: 11,
-    stock: 19,
-    reorder: 8,
-    image: image.pantry,
-  },
-  {
-    id: 5,
-    sku: "BAK-019",
-    name: "Blueberry Loaf",
-    category: "Bakery",
-    price: 6.5,
-    stock: 6,
-    reorder: 8,
-    image: image.cake,
-  },
-  {
-    id: 6,
-    sku: "MEA-012",
-    name: "Focaccia Sandwich",
-    category: "Ready meals",
-    price: 12,
-    stock: 15,
-    reorder: 7,
-    image: image.meal,
-  },
-  {
-    id: 7,
-    sku: "DRK-033",
-    name: "Cold Brew Bottle",
-    category: "Drinks",
-    price: 6,
-    stock: 31,
-    reorder: 12,
-    image: image.coffee,
-  },
-  {
-    id: 8,
-    sku: "PAN-025",
-    name: "Matcha Tin",
-    category: "Pantry",
-    price: 22,
-    stock: 5,
-    reorder: 6,
-    image: image.pantry,
-  },
-  // Ingredients live in `products` too (ERD: recipe.ingredient_id -> products).
-  // Stock is a whole number in each ingredient's base unit (g, ml or piece).
-  ...(
-    [
-      [101, "ING-001", "Arabica Coffee Beans", 4000, 1500],
-      [102, "ING-002", "Butter", 3000, 1000],
-      [103, "ING-003", "Plain Flour", 10000, 3000],
-      [104, "ING-004", "Caster Sugar", 5000, 1500],
-      [105, "ING-005", "Eggs", 60, 24],
-      [106, "ING-006", "Blueberries", 1500, 500],
-      [107, "ING-007", "Chicken Breast", 4000, 1500],
-      [108, "ING-008", "Quinoa", 3000, 1000],
-      [109, "ING-009", "Mixed Greens", 1200, 500],
-      [110, "ING-010", "Focaccia Loaf", 20, 8],
-      [111, "ING-011", "Cheddar Cheese", 1500, 500],
-      [112, "ING-012", "Glass Bottle & Cap", 80, 30],
-    ] as const
-  ).map(
-    ([id, sku, name, stock, reorder]): Product => ({
-      id,
-      sku,
-      name,
-      category: "Ingredients",
-      price: 0,
-      stock,
-      reorder,
-      image: image.pantry,
-    }),
-  ),
-]
+/** Stock photos offered in the product form (the store photo is for the login page). */
+const productPhotos = Object.entries(image).filter(([key]) => key !== "store")
+const photoOf = (product: Product) => product.image || image.pantry
 
 const INGREDIENTS = "Ingredients"
 const isIngredient = (product: Product) => product.category === INGREDIENTS
@@ -318,40 +244,6 @@ type RecipeLine = {
   createdAt: Date
   updatedAt: Date
 }
-
-const recipeSeedDate = new Date("2026-06-10T09:00:00+08:00")
-const initialRecipes: RecipeLine[] = (
-  [
-    // [product, ingredient, quantity, unit, notes]
-    [7, 101, 30, "g", "Coarse grind, 18 h steep"],
-    [7, 112, 1, "piece", null],
-    [2, 103, 60, "g", null],
-    [2, 102, 30, "g", "Laminated"],
-    [2, 104, 8, "g", null],
-    [2, 105, 0.2, "piece", "Egg wash"],
-    [5, 103, 50, "g", null],
-    [5, 102, 20, "g", null],
-    [5, 104, 25, "g", null],
-    [5, 105, 0.5, "piece", null],
-    [5, 106, 25, "g", "Per slice"],
-    [3, 107, 120, "g", "Grilled"],
-    [3, 108, 80, "g", "Cooked weight"],
-    [3, 109, 40, "g", null],
-    [6, 110, 1, "piece", null],
-    [6, 111, 25, "g", null],
-    [6, 109, 20, "g", null],
-    [6, 107, 40, "g", null],
-  ] as [number, number, number, string, string | null][]
-).map(([productId, ingredientId, quantityRequired, unit, notes], index) => ({
-  recipeId: index + 1,
-  productId,
-  ingredientId,
-  quantityRequired,
-  unit,
-  notes,
-  createdAt: recipeSeedDate,
-  updatedAt: recipeSeedDate,
-}))
 
 type NavigationItem = {
   label: View
@@ -552,46 +444,54 @@ function Heading({ title, subtitle }: HeadingProps) {
   )
 }
 
-const categories = ["Coffee", "Bakery", "Ready meals", "Pantry", "Drinks"]
-
 function NewSale({
   catalogue,
+  categories,
   cart,
   setCart,
-  saleNumber,
+  rates,
   payment,
   onPaymentChange,
   onPost,
+  posting,
+  error,
 }: {
   catalogue: Product[]
+  categories: string[]
   cart: CartLine[]
   setCart: Dispatch<SetStateAction<CartLine[]>>
-  saleNumber: string
+  rates: Rates
   payment: Payment
   onPaymentChange: (payment: Payment) => void
   onPost: () => void
+  posting: boolean
+  error: string
 }) {
   const [category, setCategory] = useState("All items")
   const [search, setSearch] = useState("")
   const query = search.trim().toLowerCase()
   // Ingredients are stock items only; they are not sold at the counter.
-  const shown = catalogue.filter(
+  const sellable = catalogue.filter((product) => product.isActive && !isIngredient(product))
+  const shown = sellable.filter(
     (product) =>
-      !isIngredient(product) &&
       (category === "All items" || product.category === category) &&
       `${product.name} ${product.sku}`.toLowerCase().includes(query),
   )
-  // Always check against live stock, not the snapshot copied into the cart line.
+  // Price and stock always come from the latest catalogue, never a copy in the cart.
+  const lines = cart
+    .map((line) => ({ ...line, product: catalogue.find((p) => p.id === line.productId) }))
+    .filter((line): line is CartLine & { product: Product } => Boolean(line.product))
   const stockOf = (id: number) =>
     catalogue.find((product) => product.id === id)?.stock ?? 0
   const inCart = (id: number) =>
-    cart.find((item) => item.id === id)?.quantity ?? 0
+    cart.find((item) => item.productId === id)?.quantity ?? 0
   const add = (product: Product) =>
     setCart((current) => {
-      const line = current.find((item) => item.id === product.id)
-      if (!line) return product.stock > 0 ? [...current, { ...product, quantity: 1 }] : current
+      const line = current.find((item) => item.productId === product.id)
+      if (!line)
+        return product.stock > 0 ? [...current, { productId: product.id, quantity: 1 }] : current
       return current.map((item) =>
-        item.id === product.id
+        item.productId === product.id
           ? { ...item, quantity: Math.min(item.quantity + 1, product.stock) }
           : item,
       )
@@ -600,24 +500,23 @@ function NewSale({
     setCart((current) =>
       current
         .map((item) =>
-          item.id === id
-            ? {
-                ...item,
-                quantity: Math.min(item.quantity + by, stockOf(id)),
-              }
+          item.productId === id
+            ? { ...item, quantity: Math.min(item.quantity + by, stockOf(id)) }
             : item,
         )
         .filter((item) => item.quantity > 0),
     )
+  const short = lines.find((line) => line.quantity > line.product.stock)
   const bill = saleBill(
-    cart.map((item) => ({ quantity: item.quantity, unitPrice: item.price })),
+    lines.map((line) => ({ quantity: line.quantity, unitPrice: line.product.price })),
+    rates,
   )
   return (
     <div className="grid min-h-full grid-cols-[minmax(520px,1fr)_330px] gap-5 p-7">
       <section>
         <Heading
           title="New sale"
-          subtitle="Create a draft sale, add whole-unit products, then post it to update stock."
+          subtitle="Add whole-unit products, then confirm to save the sale and update stock."
         />
         <p className="mb-2 mt-5 text-xs font-bold">Find a product</p>
         <label className="flex items-center gap-3 rounded border border-[#D8D9D4] bg-white px-4 py-3">
@@ -647,7 +546,7 @@ function NewSale({
         <div className="grid grid-cols-2 gap-3">
           {shown.length === 0 && (
             <p className="col-span-2 rounded-md border border-dashed border-[#D8D9D4] p-6 text-center text-xs text-[#8B8F89]">
-              No products match this search.
+              {sellable.length === 0 ? "No products yet." : "No products match this search."}
             </p>
           )}
           {shown.map((product) => (
@@ -658,7 +557,7 @@ function NewSale({
               className="group overflow-hidden rounded-md border border-[#DEDFDA] bg-white text-left transition hover:border-[#91A59F] disabled:opacity-50"
             >
               <img
-                src={product.image}
+                src={photoOf(product)}
                 alt=""
                 className="aspect-video w-full object-cover saturate-[.72]"
               />
@@ -686,21 +585,21 @@ function NewSale({
           ))}
         </div>
         <div className="mt-4 border-l-2 border-[#28695E] bg-[#EAF1EF] p-3 text-xs text-[#5E6863]">
-          <strong>Posting rule:</strong> Stock is reduced only after the draft
-          sale is posted. Every line creates one append-only stock movement.
+          <strong>Posting rule:</strong> Stock is reduced only when the sale is
+          confirmed. Every line creates one append-only stock movement.
         </div>
       </section>
       <aside className="mt-[68px] flex h-fit min-h-[520px] flex-col rounded-md border border-[#DEDFDA] bg-white">
         <div className="flex items-start justify-between border-b border-[#E4E5E0] p-5">
           <div>
-            <h2 className="font-display text-lg font-bold">Sale #{saleNumber}</h2>
+            <h2 className="font-display text-lg font-bold">Current sale</h2>
             <p className="mt-1 text-[11px] text-[#888C86]">
-              DRAFT · Created by current user
+              DRAFT · Sale number is assigned on confirm
             </p>
           </div>
           <button
             onClick={() => setCart([])}
-            disabled={!cart.length}
+            disabled={!cart.length || posting}
             aria-label="Clear sale"
             title="Clear sale"
             className="p-1 text-[#777C76] disabled:opacity-35"
@@ -709,7 +608,7 @@ function NewSale({
           </button>
         </div>
         <div className="min-h-64 flex-1 p-3">
-          {cart.length === 0 ? (
+          {lines.length === 0 ? (
             <div className="grid h-52 place-items-center text-center">
               <div>
                 <p className="text-sm font-bold">No products added</p>
@@ -719,39 +618,44 @@ function NewSale({
               </div>
             </div>
           ) : (
-            cart.map((item) => (
+            lines.map(({ product, quantity }) => (
               <div
-                key={item.id}
+                key={product.id}
                 className="flex items-center gap-3 border-b border-[#ECEDE9] py-3"
               >
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-bold">{item.name}</p>
-                  <p className="mt-1 text-[11px] text-[#888C86]">
-                    {item.sku} · {money(item.price)}
+                  <p className="truncate text-sm font-bold">{product.name}</p>
+                  <p
+                    className={`mt-1 text-[11px] ${quantity > product.stock ? "text-[#A34E42]" : "text-[#888C86]"}`}
+                  >
+                    {quantity > product.stock
+                      ? `Only ${product.stock} left`
+                      : `${product.sku} · ${money(product.price)}`}
                   </p>
                 </div>
                 <div className="flex items-center border border-[#DCDDD8]">
                   <button
-                    onClick={() => change(item.id, -1)}
-                    aria-label={`Remove one ${item.name}`}
+                    onClick={() => change(product.id, -1)}
+                    disabled={posting}
+                    aria-label={`Remove one ${product.name}`}
                     className="p-1.5"
                   >
                     <Icon name="minus" size={11} />
                   </button>
                   <span className="w-6 text-center text-xs font-bold">
-                    {item.quantity}
+                    {quantity}
                   </span>
                   <button
-                    onClick={() => change(item.id, 1)}
-                    disabled={item.quantity >= stockOf(item.id)}
-                    aria-label={`Add one ${item.name}`}
+                    onClick={() => change(product.id, 1)}
+                    disabled={posting || quantity >= product.stock}
+                    aria-label={`Add one ${product.name}`}
                     className="p-1.5 disabled:opacity-30"
                   >
                     <Icon name="plus" size={11} />
                   </button>
                 </div>
                 <strong className="w-16 text-right text-xs">
-                  {money(item.price * item.quantity)}
+                  {money(product.price * quantity)}
                 </strong>
               </div>
             ))
@@ -761,9 +665,9 @@ function NewSale({
           <dl className="space-y-1.5 text-xs text-[#6F746E]">
             {(
               [
-                [`Subtotal (${cart.reduce((s, i) => s + i.quantity, 0)} units)`, money(bill.subtotal)],
-                [`Service charge (${SERVICE_CHARGE_RATE * 100}%)`, money(bill.serviceCharge)],
-                [`SST (${SST_RATE * 100}%)`, money(bill.tax)],
+                [`Subtotal (${lines.reduce((s, i) => s + i.quantity, 0)} units)`, money(bill.subtotal)],
+                [`Service charge (${ratePct(rates.serviceChargeRate)}%)`, money(bill.serviceCharge)],
+                [`SST (${ratePct(rates.sstRate)}%)`, money(bill.tax)],
                 ["Rounding adj.", signedMoney(bill.rounding)],
               ] as [string, string][]
             ).map(([label, value]) => (
@@ -782,29 +686,33 @@ function NewSale({
               Payment method
             </p>
             <div className="mt-2 grid grid-cols-3 gap-2">
-              {payments.map(
-                (method) => (
-                  <button
-                    key={method}
-                    onClick={() => onPaymentChange(method)}
-                    className={`rounded border px-3 py-2 text-xs font-bold ${
-                      payment === method
-                        ? "border-[#28695E] bg-[#28695E] text-white"
-                        : "border-[#DCDAD4] bg-white text-[#666A65]"
-                    }`}
-                  >
-                    {method}
-                  </button>
-                ),
-              )}
+              {payments.map((method) => (
+                <button
+                  key={method}
+                  onClick={() => onPaymentChange(method)}
+                  disabled={posting}
+                  className={`rounded border px-3 py-2 text-xs font-bold ${
+                    payment === method
+                      ? "border-[#28695E] bg-[#28695E] text-white"
+                      : "border-[#DCDAD4] bg-white text-[#666A65]"
+                  }`}
+                >
+                  {method}
+                </button>
+              ))}
             </div>
           </div>
+          {error && (
+            <p role="alert" className="mt-4 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]">
+              {error}
+            </p>
+          )}
           <button
             onClick={onPost}
-            disabled={!cart.length}
+            disabled={!lines.length || posting || Boolean(short)}
             className="mt-4 w-full rounded bg-[#28695E] py-3.5 text-sm font-bold text-white disabled:opacity-35"
           >
-            Confirm
+            {posting ? "Saving sale…" : "Confirm"}
           </button>
           <p className="mt-3 text-center text-[10px] text-[#969A94]">
             Posted transactions cannot be edited or cancelled.
@@ -815,67 +723,8 @@ function NewSale({
   )
 }
 
-const ingredientIndex = (id: number) => products.findIndex((p) => p.id === id)
-// Seed lines: [product index in `products`, quantity, unit price/cost override]
-const seedLines = (items: [number, number, number?][]): TransactionLine[] =>
-  items.map(([index, quantity, unitPrice]) => ({
-    name: products[index].name,
-    sku: products[index].sku,
-    quantity,
-    unitPrice: unitPrice ?? products[index].price,
-  }))
-const seedSale = (
-  number: string,
-  status: Transaction["status"],
-  at: string,
-  by: string,
-  payment: Payment,
-  items: [number, number][],
-): Transaction => {
-  const lines = seedLines(items)
-  return { number, type: "SALE", status, at: new Date(at), by, payment, lines, ...saleBill(lines) }
-}
-const seedPurchase = (
-  number: string,
-  status: Transaction["status"],
-  at: string,
-  by: string,
-  items: [number, number, number][],
-): Transaction => {
-  const lines = seedLines(items)
-  return { number, type: "PURCHASE", status, at: new Date(at), by, payment: null, lines, ...purchaseBill(lines) }
-}
-
-// Timestamps are Malaysia Time (+08:00).
-const initialTransactions: Transaction[] = [
-  seedSale("SL-1047", "POSTED", "2026-06-18T10:31:00+08:00", "Yadanar Theint", "Cash", [[0, 2], [6, 1]]),
-  seedSale("SL-1046", "POSTED", "2026-06-18T10:08:00+08:00", "Yadanar Theint", "Card", [[1, 2], [2, 1]]),
-  seedPurchase("PO-0038", "POSTED", "2026-06-18T08:42:00+08:00", "Kaung Htet Nyein", [[1, 20, 2.4], [7, 8, 15]]),
-  seedSale("SL-1045", "POSTED", "2026-06-17T16:55:00+08:00", "Zin Ko Oo", "QR", [[5, 2], [3, 1], [4, 2]]),
-  seedPurchase("PO-0039", "DRAFT", "2026-06-17T15:20:00+08:00", "Kaung Htet Nyein", [[0, 12, 11]]),
-  seedSale("SL-1044", "CANCELLED", "2026-06-17T14:12:00+08:00", "Yadanar Theint", "Cash", [[4, 1], [6, 1]]),
-  // Ingredient deliveries: unit cost is per base unit (g / piece). Recipe costing
-  // uses each ingredient's latest posted purchase cost.
-  seedPurchase("PO-0037", "POSTED", "2026-06-16T09:15:00+08:00", "Kaung Htet Nyein", [
-    [ingredientIndex(107), 5000, 0.025],
-    [ingredientIndex(108), 3000, 0.012],
-    [ingredientIndex(109), 2000, 0.03],
-    [ingredientIndex(110), 30, 2.2],
-    [ingredientIndex(111), 2000, 0.06],
-    [ingredientIndex(112), 100, 0.8],
-  ]),
-  seedPurchase("PO-0036", "POSTED", "2026-06-15T09:05:00+08:00", "Kaung Htet Nyein", [
-    [ingredientIndex(101), 5000, 0.065],
-    [ingredientIndex(102), 3000, 0.045],
-    [ingredientIndex(103), 10000, 0.004],
-    [ingredientIndex(104), 5000, 0.0035],
-    [ingredientIndex(105), 90, 0.55],
-    [ingredientIndex(106), 2000, 0.06],
-  ]),
-]
-
 /** Thermal-style receipt. Used for the on-screen preview and for printing. */
-function Receipt({ tx }: { tx: Transaction }) {
+function Receipt({ tx, rates }: { tx: Transaction; rates: Rates }) {
   const isSale = tx.type === "SALE"
   const units = tx.lines.reduce((sum, line) => sum + line.quantity, 0)
   const Rule = () => <div className="my-3 border-t border-dashed border-[#A4A9A3]" />
@@ -929,8 +778,8 @@ function Receipt({ tx }: { tx: Transaction }) {
       <Row label={`Subtotal (${units} ${units === 1 ? "item" : "items"})`} value={money(tx.subtotal)} />
       {isSale && (
         <>
-          <Row label={`Service charge ${SERVICE_CHARGE_RATE * 100}%`} value={money(tx.serviceCharge)} />
-          <Row label={`SST ${SST_RATE * 100}%`} value={money(tx.tax)} />
+          <Row label={`Service charge ${ratePct(rates.serviceChargeRate)}%`} value={money(tx.serviceCharge)} />
+          <Row label={`SST ${ratePct(rates.sstRate)}%`} value={money(tx.tax)} />
           <Row label="Rounding adj." value={signedMoney(tx.rounding)} />
         </>
       )}
@@ -969,11 +818,13 @@ function Receipt({ tx }: { tx: Transaction }) {
  */
 function ReceiptDialog({
   tx,
+  rates,
   onClose,
   success = false,
   closeLabel = "Close",
 }: {
   tx: Transaction
+  rates: Rates
   onClose: () => void
   success?: boolean
   closeLabel?: string
@@ -1016,7 +867,7 @@ function ReceiptDialog({
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto bg-[#EEEDEA] px-6 py-6">
           <div className="mx-auto w-fit shadow-[0_1px_3px_rgba(0,0,0,.12),0_8px_24px_rgba(0,0,0,.08)]">
-            <Receipt tx={tx} />
+            <Receipt tx={tx} rates={rates} />
           </div>
         </div>
         <div className="grid grid-cols-2 gap-3 border-t border-[#E4E5E0] px-6 py-4">
@@ -1037,7 +888,7 @@ function ReceiptDialog({
       </div>
       {createPortal(
         <div className="print-root">
-          <Receipt tx={tx} />
+          <Receipt tx={tx} rates={rates} />
         </div>,
         document.body,
       )}
@@ -1048,11 +899,15 @@ function ReceiptDialog({
 function Transactions({
   transactions,
   catalogue,
+  rates,
+  isAdmin,
   onPostPurchase,
 }: {
   transactions: Transaction[]
   catalogue: Product[]
-  onPostPurchase: (product: Product, quantity: number, unitCost: number) => void
+  rates: Rates
+  isAdmin: boolean
+  onPostPurchase: (productId: number, quantity: number, unitCost: number) => Promise<void>
 }) {
   const [filter, setFilter] = useState("All")
   const filters = ["All", "Sales", "Purchases", "Drafts"]
@@ -1095,12 +950,14 @@ function Transactions({
             </button>
           ))}
         </div>
-        <button
-          className="rounded bg-[#24302C] px-4 py-2 text-xs font-bold text-white"
-          onClick={() => setPurchaseOpen(true)}
-        >
-          + New purchase
-        </button>
+        {isAdmin && (
+          <button
+            className="rounded bg-[#24302C] px-4 py-2 text-xs font-bold text-white"
+            onClick={() => setPurchaseOpen(true)}
+          >
+            + New purchase
+          </button>
+        )}
       </div>
       <Table
         headers={[
@@ -1126,14 +983,14 @@ function Transactions({
         )}
       />
       {viewing && (
-        <ReceiptDialog tx={viewing} onClose={() => setViewing(null)} />
+        <ReceiptDialog tx={viewing} rates={rates} onClose={() => setViewing(null)} />
       )}
       {purchaseOpen && (
         <NewPurchaseModal
-          catalogue={catalogue}
+          catalogue={catalogue.filter((p) => p.isActive)}
           onClose={() => setPurchaseOpen(false)}
-          onPost={(product, quantity, unitCost) => {
-            onPostPurchase(product, quantity, unitCost)
+          onPost={async (productId, quantity, unitCost) => {
+            await onPostPurchase(productId, quantity, unitCost)
             setPurchaseOpen(false)
           }}
         />
@@ -1142,6 +999,10 @@ function Transactions({
   )
 }
 
+/** Suggested unit cost for a delivery: the last purchase cost, else the selling price. */
+const defaultCost = (product?: Product) =>
+  product ? (product.costPrice > 0 ? product.costPrice : product.price) : 0
+
 function NewPurchaseModal({
   catalogue,
   onClose,
@@ -1149,24 +1010,41 @@ function NewPurchaseModal({
 }: {
   catalogue: Product[]
   onClose: () => void
-  onPost: (product: Product, quantity: number, unitCost: number) => void
+  onPost: (productId: number, quantity: number, unitCost: number) => Promise<void>
 }) {
   const [productId, setProductId] = useState(catalogue[0]?.id ?? 0)
   const [quantity, setQuantity] = useState(1)
   const product = catalogue.find((item) => item.id === productId)
-  const [unitCost, setUnitCost] = useState(product?.price ?? 0)
-  const total = unitCost * quantity
-  const post = () => {
-    if (!product || quantity < 1 || unitCost <= 0) return
-    onPost(product, quantity, unitCost)
+  const [unitCost, setUnitCost] = useState(defaultCost(product))
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+  const total = round2(unitCost * quantity)
+  const post = async () => {
+    if (!product || quantity < 1) return
+    if (unitCost <= 0) return setError("Unit cost must be greater than 0.")
+    if (Math.abs(unitCost * 10000 - Math.round(unitCost * 10000)) > 1e-6)
+      return setError("Unit cost can have at most 4 decimal places.")
+    setBusy(true)
+    setError("")
+    try {
+      await onPost(product.id, quantity, unitCost)
+    } catch (err) {
+      setError((err as Error).message)
+      setBusy(false)
+    }
   }
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-[#1F2925]/45 p-6">
       <div className="w-full max-w-sm rounded-md bg-white p-7 text-center shadow-xl">
         <h2 className="mt-4 font-display text-xl font-bold">New purchase</h2>
         <p className="mt-2 text-sm text-[#767A74]">
-          Record a supplier delivery.
+          Record a supplier delivery. Stock is added straight away.
         </p>
+        {error && (
+          <p className="mt-3 rounded bg-[#F5E7E3] px-3 py-2 text-left text-xs text-[#A34E42]">
+            {error}
+          </p>
+        )}
         <label className="mt-5 block text-left text-xs font-bold">
           Product
           <select
@@ -1174,7 +1052,7 @@ function NewPurchaseModal({
             onChange={(event) => {
               const id = Number(event.target.value)
               setProductId(id)
-              setUnitCost(catalogue.find((item) => item.id === id)?.price ?? 0)
+              setUnitCost(defaultCost(catalogue.find((item) => item.id === id)))
             }}
             className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
           >
@@ -1217,10 +1095,10 @@ function NewPurchaseModal({
         </div>
         <button
           onClick={post}
-          disabled={!product || unitCost <= 0}
+          disabled={!product || unitCost <= 0 || busy}
           className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white disabled:opacity-35"
         >
-          Post purchase
+          {busy ? "Saving…" : "Post purchase"}
         </button>
         <button
           onClick={onClose}
@@ -1243,8 +1121,8 @@ type TableProps = {
   actionWidth?: number
 }
 
-function Table({ headers, rows, empty = "No records found.", action }: TableProps) {
-  const gridTemplateColumns = `repeat(${headers.length}, minmax(0, 1fr))${action ? " 76px" : ""}`
+function Table({ headers, rows, empty = "No records found.", action, actionWidth = 76 }: TableProps) {
+  const gridTemplateColumns = `repeat(${headers.length}, minmax(0, 1fr))${action ? ` ${actionWidth}px` : ""}`
   return (
     <div className="mt-5 overflow-hidden rounded border border-[#DEDFDA] bg-white">
       <div
@@ -1295,26 +1173,30 @@ function Table({ headers, rows, empty = "No records found.", action }: TableProp
 
 function Products({
   products,
-  setProducts,
+  categories,
+  isAdmin,
+  onSaved,
 }: {
   products: Product[]
-  setProducts: Dispatch<SetStateAction<Product[]>>
+  categories: string[]
+  isAdmin: boolean
+  onSaved: (product: Product) => void
 }) {
   const [search, setSearch] = useState("")
   const query = search.trim().toLowerCase()
-  const rows = products
-    .filter((p) =>
-      `${p.name} ${p.sku} ${p.category}`.toLowerCase().includes(query),
-    )
-    .map((p) => [
-      p.sku,
-      p.name,
-      p.category,
-      isIngredient(p) ? "—" : money(p.price),
-      "Active",
-      p.updated ?? "18 Jun 2026",
-    ])
-  const [addOpen, setAddOpen] = useState(false)
+  const shown = products.filter((p) =>
+    `${p.name} ${p.sku} ${p.category}`.toLowerCase().includes(query),
+  )
+  const rows = shown.map((p) => [
+    p.sku,
+    p.name,
+    p.category,
+    isIngredient(p) ? "—" : money(p.price),
+    p.isActive ? "Active" : "Inactive",
+    myDate(new Date(p.updated)),
+  ])
+  // null = closed, "new" = add form, a product = edit form
+  const [editing, setEditing] = useState<Product | "new" | null>(null)
   return (
     <div className="p-8">
       <Heading
@@ -1331,12 +1213,14 @@ function Products({
             placeholder="Search products or SKU"
           />
         </label>
-        <button
-          className="rounded bg-[#24302C] px-4 text-xs font-bold text-white"
-          onClick={() => setAddOpen(true)}
-        >
-          + Add product
-        </button>
+        {isAdmin && (
+          <button
+            className="rounded bg-[#24302C] px-4 text-xs font-bold text-white"
+            onClick={() => setEditing("new")}
+          >
+            + Add product
+          </button>
+        )}
       </div>
       <Table
         headers={[
@@ -1349,14 +1233,27 @@ function Products({
         ]}
         rows={rows}
         empty="No products match this search."
+        action={
+          isAdmin
+            ? (index) => (
+                <button
+                  onClick={() => setEditing(shown[index])}
+                  className="rounded border border-[#D9DAD5] bg-white px-2.5 py-1.5 text-[11px] font-bold text-[#28695E] hover:border-[#28695E]"
+                >
+                  Edit
+                </button>
+              )
+            : undefined
+        }
       />
-      {addOpen && (
-        <AddProductModal
-          existingSkus={products.map((p) => p.sku.toUpperCase())}
-          onClose={() => setAddOpen(false)}
-          onAdd={(product) => {
-            setProducts((current) => [...current, product])
-            setAddOpen(false)
+      {editing && (
+        <ProductModal
+          product={editing === "new" ? null : editing}
+          categories={categories}
+          onClose={() => setEditing(null)}
+          onSaved={(product) => {
+            onSaved(product)
+            setEditing(null)
           }}
         />
       )}
@@ -1364,46 +1261,68 @@ function Products({
   )
 }
 
-function AddProductModal({
-  existingSkus,
+const CUSTOM_PHOTO = "custom"
+
+/** Add a product (product = null) or edit one. Stock is not edited here: use purchases or adjustments. */
+function ProductModal({
+  product,
+  categories,
   onClose,
-  onAdd,
+  onSaved,
 }: {
-  existingSkus: string[]
+  product: Product | null
+  categories: string[]
   onClose: () => void
-  onAdd: (product: Product) => void
+  onSaved: (product: Product) => void
 }) {
-  const [name, setName] = useState("")
-  const [sku, setSku] = useState("")
-  const [category, setCategory] = useState("Coffee")
-  const [price, setPrice] = useState(0)
+  const isNew = product === null
+  const startPhoto = product?.image ?? image.coffee
+  const preset = productPhotos.find(([, url]) => url === startPhoto)?.[0]
+  const [name, setName] = useState(product?.name ?? "")
+  const [sku, setSku] = useState(product?.sku ?? "")
+  const [category, setCategory] = useState(product?.category ?? categories[0] ?? "")
+  const [price, setPrice] = useState(product?.price ?? 0)
   const [stock, setStock] = useState(0)
-  const [reorder, setReorder] = useState(0)
-  const [imageKey, setImageKey] = useState<keyof typeof image>("coffee")
+  const [reorder, setReorder] = useState(product?.reorder ?? 0)
+  const [photo, setPhoto] = useState(preset ?? CUSTOM_PHOTO)
+  const [customUrl, setCustomUrl] = useState(preset ? "" : startPhoto)
+  const [isActive, setIsActive] = useState(product?.isActive ?? true)
   const [error, setError] = useState("")
-  const add = () => {
+  const [busy, setBusy] = useState(false)
+  const save = async () => {
     const cleanSku = sku.trim().toUpperCase()
     if (!name.trim() || !cleanSku) return setError("Name and SKU are required.")
-    if (existingSkus.includes(cleanSku))
-      return setError(`SKU ${cleanSku} already exists.`)
     if (price <= 0 && category !== INGREDIENTS)
       return setError("Selling price must be greater than 0.")
-    onAdd({
-      id: Date.now(),
-      sku: cleanSku,
-      name: name.trim(),
-      category,
-      price,
-      stock,
-      reorder,
-      image: image[imageKey],
-      updated: myDate(),
-    })
+    const imageUrl =
+      photo === CUSTOM_PHOTO ? customUrl.trim() || null : (image[photo as keyof typeof image] ?? null)
+    if (imageUrl && !/^https?:\/\/\S+$/.test(imageUrl))
+      return setError("Image must be a web address starting with http:// or https://")
+    setBusy(true)
+    setError("")
+    try {
+      const { product: saved } = isNew
+        ? await api<{ product: Product }>("/products", {
+            method: "POST",
+            body: { name: name.trim(), sku: cleanSku, category, price, stock, reorder, image: imageUrl },
+          })
+        : await api<{ product: Product }>(`/products/${product.id}`, {
+            method: "PATCH",
+            body: { name: name.trim(), price, reorder, image: imageUrl, isActive },
+          })
+      onSaved(saved)
+    } catch (err) {
+      setError((err as Error).message)
+      setBusy(false)
+    }
   }
+  const field = "mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none disabled:bg-[#F3F3F1] disabled:text-[#8B8F89]"
   return (
     <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[#1F2925]/45 p-6">
       <div className="w-full max-w-sm rounded-md bg-white p-7 text-center shadow-xl">
-        <h2 className="mt-4 font-display text-xl font-bold">Add product</h2>
+        <h2 className="mt-4 font-display text-xl font-bold">
+          {isNew ? "Add product" : `Edit ${product.name}`}
+        </h2>
         {error && (
           <p className="mt-3 rounded bg-[#F5E7E3] px-3 py-2 text-left text-xs text-[#A34E42]">
             {error}
@@ -1411,28 +1330,26 @@ function AddProductModal({
         )}
         <label className="mt-5 block text-left text-xs font-bold">
           Name
-          <input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
-          />
+          <input value={name} onChange={(event) => setName(event.target.value)} className={field} />
         </label>
         <label className="mt-3 block text-left text-xs font-bold">
           SKU
           <input
             value={sku}
+            disabled={!isNew}
             onChange={(event) => setSku(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            className={field}
           />
         </label>
         <label className="mt-3 block text-left text-xs font-bold">
           Category
           <select
             value={category}
+            disabled={!isNew}
             onChange={(event) => setCategory(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            className={field}
           >
-            {[...categories, INGREDIENTS].map((item) => (
+            {categories.map((item) => (
               <option key={item} value={item}>
                 {item}
               </option>
@@ -1446,25 +1363,25 @@ function AddProductModal({
             min={0}
             step="0.01"
             value={price}
-            onChange={(event) =>
-              setPrice(Math.max(0, Number(event.target.value) || 0))
-            }
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            onChange={(event) => setPrice(Math.max(0, Number(event.target.value) || 0))}
+            className={field}
           />
         </label>
-        <label className="mt-3 block text-left text-xs font-bold">
-          Opening stock
-          <input
-            type="number"
-            min={0}
-            step={1}
-            value={stock}
-            onChange={(event) =>
-              setStock(Math.max(0, Math.floor(Number(event.target.value)) || 0))
-            }
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
-          />
-        </label>
+        {isNew && (
+          <label className="mt-3 block text-left text-xs font-bold">
+            Opening stock
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={stock}
+              onChange={(event) =>
+                setStock(Math.max(0, Math.floor(Number(event.target.value)) || 0))
+              }
+              className={field}
+            />
+          </label>
+        )}
         <label className="mt-3 block text-left text-xs font-bold">
           Reorder level
           <input
@@ -1475,30 +1392,50 @@ function AddProductModal({
             onChange={(event) =>
               setReorder(Math.max(0, Math.floor(Number(event.target.value)) || 0))
             }
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            className={field}
           />
         </label>
         <label className="mt-3 block text-left text-xs font-bold">
           Image
-          <select
-            value={imageKey}
-            onChange={(event) =>
-              setImageKey(event.target.value as keyof typeof image)
-            }
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
-          >
-            {Object.keys(image).map((key) => (
+          <select value={photo} onChange={(event) => setPhoto(event.target.value)} className={field}>
+            {productPhotos.map(([key]) => (
               <option key={key} value={key}>
                 {key}
               </option>
             ))}
+            <option value={CUSTOM_PHOTO}>Custom image URL…</option>
           </select>
         </label>
+        {photo === CUSTOM_PHOTO && (
+          <input
+            value={customUrl}
+            onChange={(event) => setCustomUrl(event.target.value)}
+            placeholder="https://…"
+            aria-label="Image URL"
+            className={field}
+          />
+        )}
+        {!isNew && (
+          <label className="mt-4 flex items-center gap-2 text-left text-xs font-bold">
+            <input
+              type="checkbox"
+              checked={isActive}
+              onChange={(event) => setIsActive(event.target.checked)}
+            />
+            Active (shown on the sale screen)
+          </label>
+        )}
+        {!isNew && (
+          <p className="mt-3 text-left text-[11px] text-[#858983]">
+            Stock changes through purchases and inventory adjustments, so every change is audited.
+          </p>
+        )}
         <button
-          onClick={add}
-          className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white"
+          onClick={save}
+          disabled={busy}
+          className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white disabled:opacity-60"
         >
-          Add product
+          {busy ? "Saving…" : isNew ? "Add product" : "Save changes"}
         </button>
         <button
           onClick={onClose}
@@ -1515,17 +1452,9 @@ function AddProductModal({
 // Recipes & margins
 // ---------------------------------------------------------------------------
 
-/** Latest posted purchase unit cost per SKU (transactions are stored newest first). */
-const latestPurchaseCosts = (transactions: Transaction[]) => {
-  const costs = new Map<string, number>()
-  for (const tx of transactions) {
-    if (tx.type !== "PURCHASE" || tx.status !== "POSTED") continue
-    for (const line of tx.lines) {
-      if (!costs.has(line.sku)) costs.set(line.sku, line.unitPrice)
-    }
-  }
-  return costs
-}
+/** Latest posted purchase unit cost per SKU. The server keeps it in products.cost_price. */
+const latestPurchaseCosts = (catalogue: Product[]) =>
+  new Map(catalogue.filter((p) => p.costPrice > 0).map((p) => [p.sku, p.costPrice]))
 
 /** The base unit already used for an ingredient in any recipe (ERD: one consistent unit per ingredient). */
 const baseUnitOf = (ingredientId: number, recipes: RecipeLine[], exceptRecipeId?: number) =>
@@ -1640,20 +1569,36 @@ function Recipes({
   catalogue,
   recipes,
   setRecipes,
-  transactions,
   target,
-  setTarget,
+  onTargetChange,
   onApplyPrice,
 }: {
   catalogue: Product[]
   recipes: RecipeLine[]
   setRecipes: Dispatch<SetStateAction<RecipeLine[]>>
-  transactions: Transaction[]
   target: number
-  setTarget: (target: number) => void
-  onApplyPrice: (productId: number, price: number) => void
+  onTargetChange: (target: number) => Promise<void>
+  onApplyPrice: (productId: number, price: number) => Promise<void>
 }) {
-  const costs = latestPurchaseCosts(transactions)
+  const costs = latestPurchaseCosts(catalogue)
+  // The input is edited freely; the target is saved only when it is a valid whole percent.
+  const [targetText, setTargetText] = useState(String(Math.round(target * 100)))
+  const [targetError, setTargetError] = useState("")
+  useEffect(() => setTargetText(String(Math.round(target * 100))), [target])
+  const saveTarget = async () => {
+    const value = Math.round(Number(targetText))
+    if (!(value >= 1 && value <= 95)) {
+      setTargetError("Enter a whole number from 1 to 95.")
+      return setTargetText(String(Math.round(target * 100)))
+    }
+    setTargetError("")
+    if (value / 100 === target) return
+    try {
+      await onTargetChange(value / 100)
+    } catch (err) {
+      setTargetError((err as Error).message)
+    }
+  }
   const rows = catalogue
     .filter((p) => !isIngredient(p) || recipes.some((r) => r.productId === p.id))
     .map((product) => {
@@ -1696,16 +1641,18 @@ function Recipes({
               min={1}
               max={95}
               step={1}
-              value={Math.round(target * 100)}
-              onChange={(event) => {
-                const value = Math.round(Number(event.target.value))
-                if (value >= 1 && value <= 95) setTarget(value / 100)
-              }}
+              value={targetText}
+              onChange={(event) => setTargetText(event.target.value)}
+              onBlur={saveTarget}
+              onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
               aria-label="Target profit margin percent"
               className="w-20 border border-[#B9CEC8] bg-white px-2 py-1 font-display text-2xl font-bold text-[#24302C] outline-none"
             />
             <span className="font-display text-2xl text-[#24302C]">%</span>
           </div>
+          {targetError && (
+            <span className="mt-1 block text-[10px] font-normal text-[#A34E42]">{targetError}</span>
+          )}
         </label>
         {[
           [`${rows.filter((r) => r.status === "met").length} / ${evaluated.length}`, "Products meeting target"],
@@ -1807,7 +1754,7 @@ function RecipeDetail({
   catalogue: Product[]
   recipes: RecipeLine[]
   setRecipes: Dispatch<SetStateAction<RecipeLine[]>>
-  onApplyPrice: (productId: number, price: number) => void
+  onApplyPrice: (productId: number, price: number) => Promise<void>
 }) {
   const price = product.price
   const cost = costing.cost
@@ -1820,7 +1767,22 @@ function RecipeDetail({
   const [unit, setUnit] = useState("")
   const [notes, setNotes] = useState("")
   const [error, setError] = useState("")
-  const options = catalogue.filter((p) => p.id !== product.id)
+  const [busy, setBusy] = useState(false)
+  const options = catalogue.filter((p) => p.id !== product.id && p.isActive)
+  /** Runs one API change, showing any server error in the form. */
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true)
+    setError("")
+    try {
+      await action()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const replaceLine = (line: RecipeLine) =>
+    setRecipes((current) => current.map((r) => (r.recipeId === line.recipeId ? line : r)))
   const resetForm = () => {
     setEditingId(null)
     setIngredientId(0)
@@ -1863,42 +1825,38 @@ function RecipeDetail({
       (r) => r.productId === product.id && r.ingredientId === ingredientId && r.recipeId !== editingId,
     )
     if (duplicate) return setError("This ingredient is already in the recipe. Edit that line instead.")
-    const now = new Date()
-    if (editingId !== null) {
-      setRecipes((current) =>
-        current.map((r) =>
-          r.recipeId === editingId
-            ? { ...r, quantityRequired: amount, unit: cleanUnit, notes: notes.trim() || null, updatedAt: now }
-            : r,
-        ),
-      )
-    } else {
-      setRecipes((current) => [
-        ...current,
-        {
-          recipeId: Math.max(0, ...current.map((r) => r.recipeId)) + 1,
-          productId: product.id,
-          ingredientId,
-          quantityRequired: amount,
-          unit: cleanUnit,
-          notes: notes.trim() || null,
-          createdAt: now,
-          updatedAt: now,
-        },
-      ])
-    }
-    resetForm()
+    const fields = { quantityRequired: amount, unit: cleanUnit, notes: notes.trim() || null }
+    run(async () => {
+      if (editingId !== null) {
+        const { recipe } = await api<{ recipe: Wire<RecipeLine, "createdAt" | "updatedAt"> }>(
+          `/recipes/${editingId}`,
+          { method: "PATCH", body: fields },
+        )
+        replaceLine(toRecipe(recipe))
+      } else {
+        const { recipe } = await api<{ recipe: Wire<RecipeLine, "createdAt" | "updatedAt"> }>("/recipes", {
+          method: "POST",
+          body: { productId: product.id, ingredientId, ...fields },
+        })
+        setRecipes((current) => [...current, toRecipe(recipe)])
+      }
+      resetForm()
+    })
   }
-  const remove = (recipeId: number) => {
-    setRecipes((current) => current.filter((r) => r.recipeId !== recipeId))
-    if (editingId === recipeId) resetForm()
-  }
+  const remove = (recipeId: number) =>
+    run(async () => {
+      await api(`/recipes/${recipeId}`, { method: "DELETE" })
+      setRecipes((current) => current.filter((r) => r.recipeId !== recipeId))
+      if (editingId === recipeId) resetForm()
+    })
   const setLineQuantity = (recipeId: number, amount: number) =>
-    setRecipes((current) =>
-      current.map((r) =>
-        r.recipeId === recipeId ? { ...r, quantityRequired: amount, updatedAt: new Date() } : r,
-      ),
-    )
+    run(async () => {
+      const { recipe } = await api<{ recipe: Wire<RecipeLine, "createdAt" | "updatedAt"> }>(
+        `/recipes/${recipeId}`,
+        { method: "PATCH", body: { quantityRequired: amount } },
+      )
+      replaceLine(toRecipe(recipe))
+    })
 
   // ---- Suggestions when the target margin is not met ----
   const suggestions: Suggestion[] = []
@@ -1911,7 +1869,7 @@ function RecipeDetail({
       title: `Increase the price to ${money(newPrice)}`,
       detail: `From ${money(price)} (+${pct((newPrice - price) / price)}). At ${money(newPrice)} the margin is ${pct((newPrice - cost) / newPrice)}.`,
       applyLabel: `Set price to ${money(newPrice)}`,
-      apply: () => onApplyPrice(product.id, newPrice),
+      apply: () => run(() => onApplyPrice(product.id, newPrice)),
     })
 
     const purchased = costing.lines
@@ -2052,6 +2010,7 @@ function RecipeDetail({
                   </button>
                   <button
                     onClick={() => remove(line.recipeId)}
+                    disabled={busy}
                     aria-label={`Remove ${line.ingredient?.name}`}
                     className="rounded border border-[#D9DAD5] px-2 py-1 text-[#A34E42]"
                   >
@@ -2137,9 +2096,10 @@ function RecipeDetail({
               )}
               <button
                 onClick={save}
-                className="rounded bg-[#28695E] px-4 py-2 text-xs font-bold text-white"
+                disabled={busy}
+                className="rounded bg-[#28695E] px-4 py-2 text-xs font-bold text-white disabled:opacity-60"
               >
-                {editingId !== null ? "Save" : "Add"}
+                {busy ? "Saving…" : editingId !== null ? "Save" : "Add"}
               </button>
             </div>
           </div>
@@ -2148,6 +2108,9 @@ function RecipeDetail({
 
       {/* Margin outcome */}
       <div className="border-t border-[#E4E5E0] p-6">
+        {error && status === "below" && (
+          <p className="mb-4 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]">{error}</p>
+        )}
         {status === "met" && margin !== null && (
           <div className="rounded border-l-2 border-[#4F8A62] bg-[#EEF5F0] p-4 text-xs leading-relaxed text-[#45604D]">
             <strong>Target maintained.</strong> {pct(margin)} is at or above the{" "}
@@ -2175,6 +2138,7 @@ function RecipeDetail({
                   {s.apply && (
                     <button
                       onClick={s.apply}
+                      disabled={busy}
                       className="mt-3 self-start rounded border border-[#28695E] px-3 py-1.5 text-xs font-bold text-[#28695E] hover:bg-[#EAF1EF]"
                     >
                       {s.applyLabel}
@@ -2207,40 +2171,45 @@ function Inventory({
   products: Product[]
   recipes: RecipeLine[]
   movements: Movement[]
-  onAdjust: (product: Product, change: number, reason: string) => void
+  onAdjust: (productId: number, change: number, reason: string) => Promise<void>
 }) {
   // Ingredients are counted in their recipe base unit (g, ml, piece).
   const unitOf = (p: Product) =>
     (isIngredient(p) && baseUnitOf(p.id, recipes)) || "units"
   // "Updated" = time of the product's latest stock movement (list is newest first).
-  const lastMoved = (name: string) =>
-    movements.find((m) => m.product === name)?.created ?? "18 Jun · 08:00"
-  const rows = products.map((p) => [
+  const lastMoved = (id: number) => {
+    const latest = movements.find((m) => m.productId === id)
+    return latest ? myStamp(latest.created) : "—"
+  }
+  const tracked = products.filter((p) => p.isActive)
+  const rows = tracked.map((p) => [
     p.sku,
     p.name,
     `${p.stock} ${unitOf(p)}`,
     `${p.reorder} ${unitOf(p)}`,
     p.stock === 0 ? "Out of stock" : p.stock <= p.reorder ? "Low" : "In stock",
-    lastMoved(p.name),
+    lastMoved(p.id),
   ])
   // Grams and pieces can't be added together, so this counts sellable products only.
-  const unitsOnHand = products
+  const unitsOnHand = tracked
     .filter((p) => !isIngredient(p))
     .reduce((sum, p) => sum + p.stock, 0)
-  const lowCount = products.filter((p) => p.stock <= p.reorder).length
+  const lowCount = tracked.filter((p) => p.stock <= p.reorder).length
   const [adjustOpen, setAdjustOpen] = useState(false)
-  const [productId, setProductId] = useState(products[0]?.id ?? 0)
+  const [productId, setProductId] = useState(tracked[0]?.id ?? 0)
   const [adjustment, setAdjustment] = useState(0)
   const [reason, setReason] = useState("")
   const [error, setError] = useState("")
-  const product = products.find((item) => item.id === productId)
+  const [busy, setBusy] = useState(false)
+  const product = tracked.find((item) => item.id === productId)
   const openAdjust = () => {
+    if (!product) setProductId(tracked[0]?.id ?? 0)
     setAdjustment(0)
     setReason("")
     setError("")
     setAdjustOpen(true)
   }
-  const apply = () => {
+  const apply = async () => {
     if (!product) return
     if (adjustment === 0) return setError("Enter a non-zero adjustment.")
     if (product.stock + adjustment < 0)
@@ -2248,8 +2217,16 @@ function Inventory({
         `Only ${product.stock} units on hand; stock cannot go below zero.`,
       )
     if (!reason.trim()) return setError("A reason is required for the audit trail.")
-    onAdjust(product, adjustment, reason.trim())
-    setAdjustOpen(false)
+    setBusy(true)
+    setError("")
+    try {
+      await onAdjust(product.id, adjustment, reason.trim())
+      setAdjustOpen(false)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
   }
   return (
     <div className="p-8">
@@ -2261,7 +2238,7 @@ function Inventory({
         {[
           [String(unitsOnHand), "Sellable units on hand"],
           [String(lowCount), "At or below reorder level"],
-          [String(products.length), "Products tracked"],
+          [String(tracked.length), "Products tracked"],
         ].map(([value, label]) => (
           <div
             key={label}
@@ -2309,9 +2286,9 @@ function Inventory({
                 onChange={(event) => setProductId(Number(event.target.value))}
                 className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
               >
-                {products.map((item) => (
+                {tracked.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {item.name} · {item.stock} units
+                    {item.name} · {item.stock} {unitOf(item)}
                   </option>
                 ))}
               </select>
@@ -2332,6 +2309,7 @@ function Inventory({
               Reason
               <input
                 value={reason}
+                maxLength={100}
                 onChange={(event) => setReason(event.target.value)}
                 placeholder="e.g. Damaged unit, stock count correction"
                 className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
@@ -2339,9 +2317,10 @@ function Inventory({
             </label>
             <button
               onClick={apply}
-              className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white"
+              disabled={busy}
+              className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white disabled:opacity-60"
             >
-              Apply adjustment
+              {busy ? "Saving…" : "Apply adjustment"}
             </button>
             <button
               onClick={() => setAdjustOpen(false)}
@@ -2356,14 +2335,6 @@ function Inventory({
   )
 }
 
-const initialMovements: Movement[] = [
-  { id: "MV-2081", product: "House Roast Beans", type: "SALE", change: -2, source: "SL-1047", by: "Yadanar Theint", created: "18 Jun · 10:31" },
-  { id: "MV-2080", product: "Cold Brew Bottle", type: "SALE", change: -1, source: "SL-1047", by: "Yadanar Theint", created: "18 Jun · 10:31" },
-  { id: "MV-2079", product: "Butter Croissant", type: "PURCHASE", change: 20, source: "PO-0038", by: "Kaung Htet Nyein", created: "18 Jun · 08:42" },
-  { id: "MV-2078", product: "Matcha Tin", type: "PURCHASE", change: 8, source: "PO-0038", by: "Kaung Htet Nyein", created: "18 Jun · 08:42" },
-  { id: "MV-2077", product: "Blueberry Loaf", type: "ADJUSTMENT", change: -1, source: "Damaged unit", by: "Kaung Htet Nyein", created: "17 Jun · 17:10" },
-]
-
 function StockMovements({ movements }: { movements: Movement[] }) {
   const rows = movements.map((m) => [
     m.id,
@@ -2372,7 +2343,7 @@ function StockMovements({ movements }: { movements: Movement[] }) {
     m.change > 0 ? `+${m.change}` : `−${Math.abs(m.change)}`,
     m.source,
     m.by,
-    m.created,
+    myStamp(m.created),
   ])
   return (
     <div className="p-8">
@@ -2395,109 +2366,134 @@ function StockMovements({ movements }: { movements: Movement[] }) {
           "Created",
         ]}
         rows={rows}
+        empty="No stock movements yet."
       />
     </div>
   )
 }
 
-function Forecasts({ catalogue }: { catalogue: Product[] }) {
+function Forecasts({ catalogue, forecasts }: { catalogue: Product[]; forecasts: Forecast[] }) {
   const [reviewed, setReviewed] = useState(false)
-  // Predicted 7-day demand per SKU (from the forecast run). On-hand and the
-  // recommendation are derived from live stock so they stay consistent after sales/purchases.
-  const predicted: Record<string, number> = {
-    "CAF-001": 31.4,
-    "BAK-014": 23.2,
-    "MEA-008": 10.8,
-    "BAK-019": 13.6,
-    "DRK-033": 27.1,
-  }
-  const demand = catalogue
-    .filter((p) => p.sku in predicted)
-    .map((p) => {
-      const forecast = predicted[p.sku]
-      // When forecast demand exceeds stock, order enough to cover it and
-      // restore the reorder level as safety stock.
-      const order = Math.ceil(forecast + p.reorder - p.stock)
-      return [
-        p.name,
-        String(p.stock),
-        forecast.toFixed(1),
-        String(p.reorder),
-        forecast > p.stock ? `Order ${order} units` : "Stock sufficient",
-      ]
-    })
-  const total = Object.values(predicted).reduce((sum, value) => sum + value, 0)
-  const atRisk = catalogue.filter(
-    (p) => p.sku in predicted && predicted[p.sku] > p.stock,
-  ).length
+  // Predicted demand comes from forecast_results (newest run per product). On-hand and
+  // the recommendation use live stock, so they stay right after sales and purchases.
+  const items = forecasts
+    .map((forecast) => ({ forecast, product: catalogue.find((p) => p.id === forecast.productId) }))
+    .filter((item): item is { forecast: Forecast; product: Product } => Boolean(item.product))
+  const demand = items.map(({ forecast, product }) => {
+    // When forecast demand exceeds stock, order enough to cover it and
+    // restore the reorder level as safety stock.
+    const order = Math.ceil(forecast.predicted + product.reorder - product.stock)
+    return [
+      product.name,
+      String(product.stock),
+      forecast.predicted.toFixed(1),
+      String(product.reorder),
+      forecast.predicted > product.stock ? `Order ${order} units` : "Stock sufficient",
+    ]
+  })
+  const total = items.reduce((sum, { forecast }) => sum + forecast.predicted, 0)
+  const atRisk = items.filter(({ forecast, product }) => forecast.predicted > product.stock).length
+  const latest = forecasts.reduce<Forecast | null>(
+    (best, f) => (!best || f.generatedAt > best.generatedAt ? f : best),
+    null,
+  )
+  const horizon = latest?.horizonDays ?? 7
+  // One shared scale for demand and stock, so the bar and the stock marker compare directly.
+  const scale = Math.max(1, ...items.map(({ forecast, product }) => Math.max(forecast.predicted, product.stock)))
   return (
     <div className="p-8">
       <Heading
         title="Demand forecasts"
-        subtitle="Latest product-level results from forecast run 7e1c…42f · moving_average_v1."
+        subtitle={
+          latest
+            ? `Latest results from ${latest.model}${latest.modelVersion ? ` v${latest.modelVersion}` : ""} · generated ${myDateTime(latest.generatedAt)} MYT.`
+            : "No forecast results yet."
+        }
       />
-      <div className="mt-6 grid grid-cols-[1fr_280px] gap-5">
-        <div className="rounded border border-[#DEDFDA] bg-white p-5">
-          <div className="flex justify-between">
-            <div>
-              <p className="text-xs font-bold">Forecast demand · next 7 days</p>
-              <p className="mt-1 text-[11px] text-[#858983]">
-                Training window: 18 Mar – 17 Jun 2026
-              </p>
-            </div>
-            <span className="text-xs font-bold text-[#28695E]">
-              {total.toFixed(1)} units
-            </span>
-          </div>
-          <div className="mt-8 flex h-44 items-end gap-3 border-b border-[#D7D9D4]">
-            {[46, 58, 52, 66, 81, 94, 72].map((height, index) => (
-              <div key={index} className="flex h-full flex-1 items-end">
-                <div
-                  className="w-full bg-[#73958D]"
-                  style={{ height: `${height}%` }}
-                />
+      {items.length === 0 ? (
+        <p className="mt-6 rounded border border-dashed border-[#D8D9D4] bg-white p-8 text-center text-xs text-[#8B8F89]">
+          No forecasts have been generated yet. When the forecast job writes to
+          forecast_results, the results appear here.
+        </p>
+      ) : (
+        <>
+          <div className="mt-6 grid grid-cols-[1fr_280px] gap-5">
+            <figure className="rounded border border-[#DEDFDA] bg-white p-5">
+              <div className="flex justify-between">
+                <figcaption>
+                  <p className="text-xs font-bold">Predicted demand · next {horizon} days</p>
+                  <p className="mt-1 text-[11px] text-[#858983]">
+                    Bar = predicted units · marker = units on hand now
+                  </p>
+                </figcaption>
+                <span className="text-xs font-bold text-[#28695E]">
+                  {total.toFixed(1)} units
+                </span>
               </div>
-            ))}
+              <div className="mt-5 space-y-2.5">
+                {items.map(({ forecast, product }) => {
+                  const short = forecast.predicted > product.stock
+                  return (
+                    <div
+                      key={product.id}
+                      className="group grid grid-cols-[150px_1fr_52px] items-center gap-3 text-[11px]"
+                      title={`${product.name}: ${forecast.predicted.toFixed(1)} predicted, ${product.stock} on hand`}
+                    >
+                      <span className="truncate text-[#5E6863]">{product.name}</span>
+                      <div className="relative h-4">
+                        <div
+                          className="h-full rounded-r bg-[#73958D] group-hover:bg-[#28695E]"
+                          style={{ width: `${(forecast.predicted / scale) * 100}%` }}
+                        />
+                        <div
+                          className="absolute -top-0.5 h-5 w-0.5 bg-[#24302C]"
+                          style={{ left: `${(product.stock / scale) * 100}%` }}
+                        />
+                      </div>
+                      <span className="text-right tabular-nums text-[#24302C]">
+                        {forecast.predicted.toFixed(1)}
+                        {short && <span className="sr-only"> (more than stock)</span>}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </figure>
+            <div className="rounded border border-[#CAD7D3] bg-[#EAF1EF] p-5">
+              <Icon name="trend" size={20} />
+              <p className="mt-5 text-xs font-bold uppercase tracking-[.12em] text-[#28695E]">
+                Forecast note
+              </p>
+              <h2 className="mt-3 font-display text-xl font-bold">
+                {atRisk > 0 ? "Stock needs attention." : "Stock covers demand."}
+              </h2>
+              <p className="mt-3 text-xs leading-relaxed text-[#606A65]">
+                {atRisk > 0
+                  ? `Predicted demand exceeds available stock for ${atRisk} product${atRisk === 1 ? "" : "s"} during the next ${horizon}-day period.`
+                  : `Available stock covers predicted demand for the next ${horizon}-day period.`}
+              </p>
+              <button
+                className="mt-5 text-xs font-bold text-[#28695E]"
+                onClick={() => setReviewed(true)}
+              >
+                {reviewed
+                  ? "Recommendations reviewed ✓"
+                  : "Review recommendations →"}
+              </button>
+            </div>
           </div>
-          <div className="mt-2 grid grid-cols-7 text-center text-[10px] text-[#858983]">
-            {["M", "T", "W", "T", "F", "S", "S"].map((day, index) => (
-              <span key={`${day}-${index}`}>{day}</span>
-            ))}
-          </div>
-        </div>
-        <div className="rounded border border-[#CAD7D3] bg-[#EAF1EF] p-5">
-          <Icon name="trend" size={20} />
-          <p className="mt-5 text-xs font-bold uppercase tracking-[.12em] text-[#28695E]">
-            Forecast note
-          </p>
-          <h2 className="mt-3 font-display text-xl font-bold">
-            {atRisk > 0 ? "Stock needs attention." : "Stock covers demand."}
-          </h2>
-          <p className="mt-3 text-xs leading-relaxed text-[#606A65]">
-            {atRisk > 0
-              ? `Predicted demand exceeds available stock for ${atRisk} product${atRisk === 1 ? "" : "s"} during the next seven-day period.`
-              : "Available stock covers predicted demand for the next seven-day period."}
-          </p>
-          <button
-            className="mt-5 text-xs font-bold text-[#28695E]"
-            onClick={() => setReviewed(true)}
-          >
-            {reviewed
-              ? "Recommendations reviewed ✓"
-              : "Review recommendations →"}
-          </button>
-        </div>
-      </div>
-      <Table
-        headers={[
-          "Product",
-          "On hand",
-          "Predicted demand",
-          "Reorder level",
-          "Recommendation",
-        ]}
-        rows={demand}
-      />
+          <Table
+            headers={[
+              "Product",
+              "On hand",
+              "Predicted demand",
+              "Reorder level",
+              "Recommendation",
+            ]}
+            rows={demand}
+          />
+        </>
+      )}
     </div>
   )
 }
@@ -2854,26 +2850,20 @@ function MalaysiaClock() {
   )
 }
 
+/** UUID for a sale's requestId. randomUUID needs HTTPS (or localhost); fall back otherwise. */
+const newRequestId = () => {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID()
+  const b = crypto.getRandomValues(new Uint8Array(16))
+  b[6] = (b[6] & 0x0f) | 0x40 // version 4
+  b[8] = (b[8] & 0x3f) | 0x80 // variant
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
 export default function App() {
   const [user, setUser] = useState<SessionUser | null>(null)
   // True until we know whether a session cookie from an earlier visit is still valid.
   const [checkingSession, setCheckingSession] = useState(true)
-  const [view, setView] = useState<View>("New sale")
-  const [cart, setCart] = useState<CartLine[]>([
-    { ...products[1], quantity: 2 },
-    { ...products[6], quantity: 1 },
-  ])
-  const [posted, setPosted] = useState<Transaction | null>(null)
-  const [payment, setPayment] = useState<Payment>("Cash")
-  const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions)
-  const [catalogue, setCatalogue] = useState<Product[]>(products)
-  const [movements, setMovements] = useState<Movement[]>(initialMovements)
-  const [recipes, setRecipes] = useState<RecipeLine[]>(initialRecipes)
-  const [targetMargin, setTargetMargin] = useState(0.6)
-  const [nextSale, setNextSale] = useState(1048)
-  const [nextPurchase, setNextPurchase] = useState(40)
-  const [nextMovement, setNextMovement] = useState(2082)
-  const lowStockCount = catalogue.filter((p) => p.stock <= p.reorder).length
 
   // Restore the session on page load: the cookie is httpOnly, so ask the server who we are.
   useEffect(() => {
@@ -2883,33 +2873,13 @@ export default function App() {
       .finally(() => setCheckingSession(false))
   }, [])
 
-  // Applies stock deltas to the catalogue and appends one movement per line.
-  const recordMovements = (
-    lines: { product: Product; change: number }[],
-    type: Movement["type"],
-    source: string,
-    by: string,
-  ) => {
-    setCatalogue((current) =>
-      current.map((product) => {
-        const line = lines.find((l) => l.product.id === product.id)
-        return line ? { ...product, stock: product.stock + line.change } : product
-      }),
-    )
-    setMovements((current) => [
-      ...lines.map((line, index) => ({
-        id: `MV-${nextMovement + lines.length - 1 - index}`,
-        product: line.product.name,
-        type,
-        change: line.change,
-        source,
-        by,
-        created: myStamp(),
-      })),
-      ...current,
-    ])
-    setNextMovement((n) => n + lines.length)
-  }
+  // Any request that comes back 401 (session expired, account disabled) returns to sign-in.
+  useEffect(() => {
+    onSessionLost = () => setUser(null)
+    return () => {
+      onSessionLost = () => {}
+    }
+  }, [])
 
   if (checkingSession)
     return (
@@ -2917,79 +2887,153 @@ export default function App() {
         Loading…
       </main>
     )
-  if (!user)
-    return (
-      <Login
-        onLogin={(signedIn) => {
-          setUser(signedIn)
-          setView("New sale")
-        }}
-      />
-    )
-  const role = user.role
-  const allowed = (item: NavigationItem) => !item.admin || role === "ADMIN"
-  const currentUser = user.name
+  if (!user) return <Login onLogin={setUser} />
   const signOut = async () => {
     // Clear the screen even if the request fails; the cookie expires on its own.
     await api("/auth/logout", { method: "POST" }).catch(() => {})
     setUser(null)
   }
-  const saleNumber = `SL-${nextSale}`
+  // Keyed by user, so signing out throws away everything the last person loaded.
+  return <Workspace key={user.id} user={user} onSignOut={signOut} />
+}
 
-  const postSale = () => {
-    // Re-validate against live stock in case it changed since items were added.
-    const short = cart.find((item) => {
-      const live = catalogue.find((p) => p.id === item.id)
-      return !live || live.stock < item.quantity
+type Settings = Rates & { targetMargin: number }
+
+/** The signed-in app. Every screen reads from and writes to the API; nothing is kept only in the browser. */
+function Workspace({ user, onSignOut }: { user: SessionUser; onSignOut: () => void }) {
+  const isAdmin = user.role === "ADMIN"
+  const [view, setView] = useState<View>("New sale")
+  const [catalogue, setCatalogue] = useState<Product[]>([])
+  const [categories, setCategories] = useState<string[]>([])
+  const [settings, setSettings] = useState<Settings>({ ...DEFAULT_RATES, targetMargin: 0.6 })
+  const [transactions, setTransactions] = useState<Transaction[]>([])
+  const [movements, setMovements] = useState<Movement[]>([])
+  const [recipes, setRecipes] = useState<RecipeLine[]>([])
+  const [forecasts, setForecasts] = useState<Forecast[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [loadError, setLoadError] = useState("")
+
+  const [cart, setCart] = useState<CartLine[]>([])
+  const [payment, setPayment] = useState<Payment>("Cash")
+  const [posting, setPosting] = useState(false)
+  const [saleError, setSaleError] = useState("")
+  // Kept until the sale is saved: a retry after a lost reply sends the same id, so the
+  // server returns the first sale instead of charging twice.
+  const [saleRequestId, setSaleRequestId] = useState<string | null>(null)
+  const [posted, setPosted] = useState<Transaction | null>(null)
+
+  // Only the newest load may write its results, so a slow older reply can't overwrite newer data.
+  const loadSeq = useRef(0)
+  const load = useCallback(async () => {
+    const seq = ++loadSeq.current
+    try {
+      const [p, c, s, t, adminData] = await Promise.all([
+        api<{ products: Product[] }>(isAdmin ? "/products?all=1" : "/products"),
+        api<{ categories: Category[] }>("/categories"),
+        api<{ settings: Settings }>("/settings"),
+        api<{ transactions: Wire<Transaction, "at">[] }>("/transactions"),
+        isAdmin
+          ? Promise.all([
+              api<{ recipes: Wire<RecipeLine, "createdAt" | "updatedAt">[] }>("/recipes"),
+              api<{ movements: Wire<Movement, "created">[] }>("/stock-movements"),
+              api<{ forecasts: Wire<Forecast, "generatedAt">[] }>("/forecasts"),
+            ])
+          : Promise.resolve(null),
+      ])
+      if (seq !== loadSeq.current) return
+      setCatalogue(p.products)
+      setCategories(c.categories.map((category) => category.name))
+      setSettings(s.settings)
+      setTransactions(t.transactions.map(toTransaction))
+      if (adminData) {
+        const [r, m, f] = adminData
+        setRecipes(r.recipes.map(toRecipe))
+        setMovements(m.movements.map(toMovement))
+        setForecasts(f.forecasts.map(toForecast))
+      }
+      setLoadError("")
+    } catch (err) {
+      if (seq === loadSeq.current) setLoadError((err as Error).message)
+    } finally {
+      if (seq === loadSeq.current) setLoaded(true)
+    }
+  }, [isAdmin])
+
+  // Load on sign-in and again on every screen change, so each till sees other tills' sales.
+  useEffect(() => {
+    load()
+  }, [load, view])
+
+  // Drop cart lines whose product was deactivated or removed since it was added.
+  useEffect(() => {
+    setCart((current) => {
+      const kept = current.filter((line) =>
+        catalogue.some((p) => p.id === line.productId && p.isActive && !isIngredient(p)),
+      )
+      return kept.length === current.length ? current : kept
     })
-    if (!cart.length || short) return
-    recordMovements(
-      cart.map((item) => ({ product: item, change: -item.quantity })),
-      "SALE",
-      saleNumber,
-      currentUser,
+  }, [catalogue])
+
+  const replaceProduct = (product: Product) =>
+    setCatalogue((current) =>
+      current.some((p) => p.id === product.id)
+        ? current.map((p) => (p.id === product.id ? product : p))
+        : [...current, product],
     )
-    const lines: TransactionLine[] = cart.map((item) => ({
-      name: item.name,
-      sku: item.sku,
-      quantity: item.quantity,
-      unitPrice: item.price,
-    }))
-    const sale: Transaction = {
-      number: saleNumber,
-      type: "SALE",
-      status: "POSTED",
-      at: new Date(),
-      by: currentUser,
-      payment,
-      lines,
-      ...saleBill(lines),
+
+  const postSale = async () => {
+    const requestId = saleRequestId ?? newRequestId()
+    setSaleRequestId(requestId)
+    setPosting(true)
+    setSaleError("")
+    try {
+      const { sale } = await api<{ sale: Wire<Transaction, "at"> }>("/sales", {
+        method: "POST",
+        body: {
+          requestId,
+          payment,
+          lines: cart.map((line) => ({ productId: line.productId, quantity: line.quantity })),
+        },
+      })
+      setSaleRequestId(null)
+      setPosted(toTransaction(sale))
+    } catch (err) {
+      setSaleError((err as Error).message)
+    } finally {
+      setPosting(false)
+      load() // fresh stock either way
     }
-    setTransactions((current) => [sale, ...current])
-    // The sale number advances when the cashier starts the next sale (onDone),
-    // so the cart behind the confirmation still shows the sale just posted.
-    setPosted(sale)
   }
 
-  const postPurchase = (product: Product, quantity: number, unitCost: number) => {
-    const number = `PO-${String(nextPurchase).padStart(4, "0")}`
-    recordMovements([{ product, change: quantity }], "PURCHASE", number, currentUser)
-    const lines: TransactionLine[] = [
-      { name: product.name, sku: product.sku, quantity, unitPrice: unitCost },
-    ]
-    const purchase: Transaction = {
-      number,
-      type: "PURCHASE",
-      status: "POSTED",
-      at: new Date(),
-      by: currentUser,
-      payment: null,
-      lines,
-      ...purchaseBill(lines),
-    }
-    setTransactions((current) => [purchase, ...current])
-    setNextPurchase((n) => n + 1)
+  const postPurchase = async (productId: number, quantity: number, unitCost: number) => {
+    await api("/purchases", { method: "POST", body: { productId, quantity, unitCost } })
+    await load()
   }
+
+  const adjustStock = async (productId: number, change: number, reason: string) => {
+    await api("/inventory/adjustments", { method: "POST", body: { productId, change, reason } })
+    await load()
+  }
+
+  const applyPrice = async (productId: number, price: number) => {
+    const { product } = await api<{ product: Product }>(`/products/${productId}`, {
+      method: "PATCH",
+      body: { price },
+    })
+    replaceProduct(product)
+  }
+
+  const saveTargetMargin = async (value: number) => {
+    const { settings: saved } = await api<{ settings: Settings }>("/settings/target-margin", {
+      method: "PUT",
+      body: { value },
+    })
+    setSettings(saved)
+  }
+
+  const allowed = (item: NavigationItem) => !item.admin || isAdmin
+  const lowStockCount = catalogue.filter((p) => p.isActive && p.stock <= p.reorder).length
+
   return (
     <main className="flex h-screen min-w-[1100px] flex-col overflow-hidden bg-[#F3F3F1] text-[#24302C]">
       <header className="flex h-16 shrink-0 items-center border-b border-[#E2E3DF] bg-white px-6">
@@ -2997,18 +3041,14 @@ export default function App() {
           Juniper Cafe
         </div>
         <div className="flex-1 text-center text-[10px] text-[#858984]">
-          Main Store · MYR · DEMO WORKSPACE
+          Main Store · MYR
         </div>
         <div className="flex w-[340px] items-center justify-end gap-3 text-[10px]">
           <MalaysiaClock />
           <span>
-            {currentUser} · {role}
+            {user.name} · {user.role}
           </span>
-          <button
-            onClick={signOut}
-            title="Sign out"
-            aria-label="Sign out"
-          >
+          <button onClick={onSignOut} title="Sign out" aria-label="Sign out">
             <Icon name="logout" />
           </button>
         </div>
@@ -3033,83 +3073,103 @@ export default function App() {
                     <Icon name="lock" size={11} />
                   </span>
                 )}
-                {item.label === "Inventory" &&
-                  role === "ADMIN" &&
-                  lowStockCount > 0 && (
-                    <span
-                      className="ml-auto rounded-full bg-[#F5E7E3] px-1.5 py-0.5 text-[9px] text-[#A34E42]"
-                      title={`${lowStockCount} products at or below reorder level`}
-                    >
-                      {lowStockCount}
-                    </span>
-                  )}
+                {item.label === "Inventory" && isAdmin && lowStockCount > 0 && (
+                  <span
+                    className="ml-auto rounded-full bg-[#F5E7E3] px-1.5 py-0.5 text-[9px] text-[#A34E42]"
+                    title={`${lowStockCount} products at or below reorder level`}
+                  >
+                    {lowStockCount}
+                  </span>
+                )}
               </button>
             ))}
           </nav>
         </aside>
         <section className="min-w-0 flex-1 overflow-y-auto bg-[#F5F4F0]">
-          {view === "New sale" && (
-            <NewSale
-              catalogue={catalogue}
-              cart={cart}
-              setCart={setCart}
-              saleNumber={saleNumber}
-              payment={payment}
-              onPaymentChange={setPayment}
-              onPost={postSale}
-            />
+          {loadError && (
+            <div
+              role="alert"
+              className="mx-8 mt-6 flex items-center justify-between rounded bg-[#F5E7E3] px-4 py-3 text-xs text-[#A34E42]"
+            >
+              <span>
+                {loaded && catalogue.length ? "Could not refresh data: " : "Could not load data: "}
+                {loadError}
+              </span>
+              <button onClick={() => load()} className="font-bold underline">
+                Retry
+              </button>
+            </div>
           )}
-          {view === "Transactions" && (
-            <Transactions
-              transactions={transactions}
-              catalogue={catalogue}
-              onPostPurchase={postPurchase}
-            />
+          {!loaded ? (
+            <p className="p-8 text-xs text-[#858983]">Loading workspace…</p>
+          ) : (
+            <>
+              {view === "New sale" && (
+                <NewSale
+                  catalogue={catalogue}
+                  categories={categories.filter((name) => name !== INGREDIENTS)}
+                  cart={cart}
+                  setCart={setCart}
+                  rates={settings}
+                  payment={payment}
+                  onPaymentChange={setPayment}
+                  onPost={postSale}
+                  posting={posting}
+                  error={saleError}
+                />
+              )}
+              {view === "Transactions" && (
+                <Transactions
+                  transactions={transactions}
+                  catalogue={catalogue}
+                  rates={settings}
+                  isAdmin={isAdmin}
+                  onPostPurchase={postPurchase}
+                />
+              )}
+              {view === "Products" && (
+                <Products
+                  products={catalogue}
+                  categories={categories}
+                  isAdmin={isAdmin}
+                  onSaved={replaceProduct}
+                />
+              )}
+              {view === "Recipes" && (
+                <Recipes
+                  catalogue={catalogue}
+                  recipes={recipes}
+                  setRecipes={setRecipes}
+                  target={settings.targetMargin}
+                  onTargetChange={saveTargetMargin}
+                  onApplyPrice={applyPrice}
+                />
+              )}
+              {view === "Inventory" && (
+                <Inventory
+                  products={catalogue}
+                  recipes={recipes}
+                  movements={movements}
+                  onAdjust={adjustStock}
+                />
+              )}
+              {view === "Stock movements" && <StockMovements movements={movements} />}
+              {view === "Forecasts" && <Forecasts catalogue={catalogue} forecasts={forecasts} />}
+              {view === "Users" && <Users currentUserId={user.id} />}
+            </>
           )}
-          {view === "Products" && (
-            <Products products={catalogue} setProducts={setCatalogue} />
-          )}
-          {view === "Recipes" && (
-            <Recipes
-              catalogue={catalogue}
-              recipes={recipes}
-              setRecipes={setRecipes}
-              transactions={transactions}
-              target={targetMargin}
-              setTarget={setTargetMargin}
-              onApplyPrice={(productId, price) =>
-                setCatalogue((current) =>
-                  current.map((p) =>
-                    p.id === productId ? { ...p, price, updated: myDate() } : p,
-                  ),
-                )
-              }
-            />
-          )}
-          {view === "Inventory" && (
-            <Inventory
-              products={catalogue}
-              recipes={recipes}
-              movements={movements}
-              onAdjust={(product, change, reason) =>
-                recordMovements([{ product, change }], "ADJUSTMENT", reason, currentUser)
-              }
-            />
-          )}
-          {view === "Stock movements" && <StockMovements movements={movements} />}
-          {view === "Forecasts" && <Forecasts catalogue={catalogue} />}
-          {view === "Users" && <Users currentUserId={user.id} />}
         </section>
       </div>
       {posted && (
         <ReceiptDialog
           tx={posted}
+          rates={settings}
           success
           closeLabel="Start another sale"
           onClose={() => {
             setPosted(null)
             setCart([])
-            setNextSale((n) => n + 1)
+            setSaleError("")
           }}
         />
       )}

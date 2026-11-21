@@ -34,6 +34,11 @@ export default defineConfig(({ mode }) => {
       host: process.env.FIGMA_DEV_SERVER_HOST || "0.0.0.0",
       port: parseInt(process.env.PORT || "8443"),
       strictPort: true,
+      // In development, send /api to the Express server (server/, port 3000).
+      // In production Caddy does this (deploy/Caddyfile).
+      proxy: {
+        "/api": process.env.API_URL || "http://localhost:3000",
+      },
       watch: {
         ignored: ["**/.figma/**"],
       },

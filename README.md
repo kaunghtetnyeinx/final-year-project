@@ -27,8 +27,18 @@ Open the address it prints, e.g. http://localhost:5173/ . Stop the server with C
 
 ## Sign-in
 
-Demo accounts (no password needed): **Admin** (Kaung Htet Nyein, all screens) or
-**Staff** (Yadanar Theint, sales screens only).
+Sign-in uses the API in `server/` (email + password, bcrypt hashes, httpOnly session
+cookie). Run the API alongside the front end: `vite dev` forwards `/api` to
+`http://localhost:3000` (override with `API_URL`); in production Caddy does this.
+
+Seeded accounts all use the password `Juniper@2026` (change them after first deploy):
+**Admin** `kaunghtet@juniper.store` (all screens) or **Staff** `yadanar@juniper.store`
+(sales screens only).
+
+Admins create new accounts under **Users → + Add staff user** (name, email, role and
+password: at least 10 characters with letters and numbers). The Users screen can also
+set a new password for anyone and disable or enable accounts. A disabled account is
+signed out on its next request.
 
 ## Main features
 

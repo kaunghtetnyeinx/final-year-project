@@ -2,6 +2,7 @@ import {
   useEffect,
   useState,
   type Dispatch,
+  type FormEvent,
   type ReactNode,
   type SetStateAction,
 } from "react"
@@ -86,10 +87,52 @@ const purchaseBill = (lines: { quantity: number; unitPrice: number }[]): Bill =>
   return { subtotal, serviceCharge: 0, tax: 0, rounding: 0, total: subtotal }
 }
 
-const userName = (role: Role) =>
-  role === "ADMIN" ? "Kaung Htet Nyein" : "Yadanar Theint"
-const userEmail = (role: Role) =>
-  role === "ADMIN" ? "kaunghtet@juniper.store" : "yadanar@juniper.store"
+/** The signed-in account, as returned by the API (see server/src/auth.js publicUser). */
+type SessionUser = { id: number; name: string; email: string; role: Role }
+
+/** A user row from GET /api/users (see server/src/routes/admin.js toUser). */
+type StaffUser = {
+  id: number
+  code: string
+  name: string
+  email: string
+  role: Role
+  isActive: boolean
+  createdAt: string
+}
+
+/**
+ * Calls the POS API. The session lives in an httpOnly cookie, so the browser
+ * sends it automatically; the page never sees or stores the token.
+ * Throws an Error carrying the server's message on any non-2xx reply.
+ */
+async function api<T>(path: string, options: { method?: string; body?: unknown } = {}): Promise<T> {
+  let response: Response
+  try {
+    response = await fetch(`/api${path}`, {
+      method: options.method ?? "GET",
+      credentials: "same-origin",
+      headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    })
+  } catch {
+    throw new Error("Cannot reach the server. Check your connection and try again.")
+  }
+  if (response.status === 204) return undefined as T
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    // Validation errors carry field messages in details; show the first one.
+    const detail = Array.isArray(data.details) ? data.details[0]?.message : undefined
+    throw new Error(
+      detail ||
+        data.error ||
+        (response.status >= 500
+          ? "The server is not responding. Please try again shortly."
+          : `Request failed (${response.status})`),
+    )
+  }
+  return data as T
+}
 
 type Role = "ADMIN" | "STAFF"
 type View = "New sale" | "Transactions" | "Products" | "Recipes" | "Inventory" | "Stock movements" | "Forecasts" | "Users"
@@ -386,8 +429,29 @@ function Icon({ name, size = 16 }: IconProps) {
   )
 }
 
-function Login({ onLogin }: { onLogin: (role: Role) => void }) {
-  const [role, setRole] = useState<Role>("ADMIN")
+function Login({ onLogin }: { onLogin: (user: SessionUser) => void }) {
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!email.trim() || !password) return setError("Enter your email and password.")
+    setBusy(true)
+    setError("")
+    try {
+      const { user } = await api<{ user: SessionUser }>("/auth/login", {
+        method: "POST",
+        body: { email: email.trim(), password },
+      })
+      onLogin(user)
+    } catch (err) {
+      setError((err as Error).message)
+      setPassword("")
+    } finally {
+      setBusy(false)
+    }
+  }
   return (
     <main className="grid min-h-screen grid-cols-[1fr_1fr] bg-[#F5F4F0]">
       <section className="relative m-4 overflow-hidden">
@@ -415,66 +479,58 @@ function Login({ onLogin }: { onLogin: (role: Role) => void }) {
         </div>
       </section>
       <section className="flex items-center justify-center px-16">
-        <div className="w-full max-w-sm">
+        <form className="w-full max-w-sm" onSubmit={submit} noValidate>
           <p className="text-xs font-bold uppercase tracking-[.16em] text-[#28695E]">
-            FYP prototype
+            Juniper Cafe POS
           </p>
           <h2 className="mt-3 font-display text-3xl font-bold">
             Sign in to workspace
           </h2>
           <p className="mt-2 text-sm text-[#757973]">
-            Select an account type to test permissions.
+            Use the account your administrator created for you.
           </p>
-          <div className="mt-7 grid grid-cols-2 gap-3">
-            {(["ADMIN", "STAFF"] as Role[]).map((item) => (
-              <button
-                key={item}
-                onClick={() => setRole(item)}
-                className={`border p-4 text-left ${
-                  role === item
-                    ? "border-[#28695E] bg-[#EAF1EF]"
-                    : "border-[#D9DAD5] bg-white"
-                }`}
-              >
-                <span className="text-sm font-bold">
-                  {item === "ADMIN" ? "Admin" : "Staff"}
-                </span>
-                <span className="mt-1 block text-[11px] text-[#7C807A]">
-                  {item === "ADMIN"
-                    ? "Full inventory access"
-                    : "Sales workspace"}
-                </span>
-              </button>
-            ))}
-          </div>
-          <label className="mt-5 block text-xs font-bold">
+          {error && (
+            <p
+              role="alert"
+              className="mt-6 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]"
+            >
+              {error}
+            </p>
+          )}
+          <label className="mt-6 block text-xs font-bold">
             Email
             <input
-              readOnly
-              value={userEmail(role)}
-              className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3.5 text-sm outline-none"
+              type="email"
+              autoComplete="username"
+              autoFocus
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3.5 text-sm outline-none focus:border-[#28695E]"
             />
           </label>
           <label className="mt-4 block text-xs font-bold">
             Password
             <input
-              readOnly
-              value="••••••••••"
-              className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3.5 text-sm outline-none"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3.5 text-sm outline-none focus:border-[#28695E]"
             />
           </label>
           <button
-            onClick={() => onLogin(role)}
-            className="mt-6 flex w-full items-center justify-between bg-[#28695E] px-5 py-4 text-sm font-bold text-white"
+            type="submit"
+            disabled={busy}
+            className="mt-6 flex w-full items-center justify-between bg-[#28695E] px-5 py-4 text-sm font-bold text-white disabled:opacity-60"
           >
-            <span>Continue as {role === "ADMIN" ? "Admin" : "Staff"}</span>
+            <span>{busy ? "Signing in…" : "Sign in"}</span>
             <Icon name="arrow" />
           </button>
           <p className="mt-4 flex items-center gap-2 text-[11px] text-[#858983]">
             <Icon name="lock" size={13} />
-            Demo only · Passwords are never stored in plaintext
+            Passwords are hashed with bcrypt and never stored in plaintext
           </p>
-        </div>
+        </form>
       </section>
     </main>
   )
@@ -1183,6 +1239,8 @@ type TableProps = {
   empty?: string
   /** Optional trailing cell per row, e.g. a button. Receives the row index. */
   action?: (rowIndex: number) => ReactNode
+  /** Width of the action column in px (default 76). */
+  actionWidth?: number
 }
 
 function Table({ headers, rows, empty = "No records found.", action }: TableProps) {
@@ -2444,28 +2502,45 @@ function Forecasts({ catalogue }: { catalogue: Product[] }) {
   )
 }
 
-const initialUsers: string[][] = [
-  // User ID, Full name, Email, Role, Status, Created
-  ["USR-001", "Kaung Htet Nyein", "kaunghtet@juniper.store", "ADMIN", "Active", "12 Jan 2026"],
-  ["USR-002", "Yadanar Theint", "yadanar@juniper.store", "STAFF", "Active", "03 Feb 2026"],
-  ["USR-003", "Zin Ko Oo", "zinkooo@juniper.store", "STAFF", "Active", "19 Mar 2026"],
-  ["USR-004", "Peh Yan Bin", "yanbin@juniper.store", "STAFF", "Active", "07 Apr 2026"],
-  ["USR-005", "Tan Yaw Pin", "yawpin@juniper.store", "STAFF", "Active", "21 Apr 2026"],
-  ["USR-006", "Khong Cheng Hao", "chenghao@juniper.store", "STAFF", "Active", "05 May 2026"],
-]
-
-function Users({
-  rows,
-  setRows,
-}: {
-  rows: string[][]
-  setRows: Dispatch<SetStateAction<string[][]>>
-}) {
+function Users({ currentUserId }: { currentUserId: number }) {
+  const [users, setUsers] = useState<StaffUser[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState("")
   const [addOpen, setAddOpen] = useState(false)
-  const addUser = (row: string[]) => {
-    setRows((current) => [row, ...current])
-    setAddOpen(false)
+  const [resetFor, setResetFor] = useState<StaffUser | null>(null)
+
+  useEffect(() => {
+    api<{ users: StaffUser[] }>("/users")
+      .then(({ users }) => setUsers(users))
+      .catch((err) => setError((err as Error).message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const replace = (user: StaffUser) =>
+    setUsers((current) => current.map((u) => (u.id === user.id ? user : u)))
+
+  const toggleActive = async (user: StaffUser) => {
+    setError("")
+    try {
+      const { user: updated } = await api<{ user: StaffUser }>(`/users/${user.id}`, {
+        method: "PATCH",
+        body: { isActive: !user.isActive },
+      })
+      replace(updated)
+    } catch (err) {
+      setError((err as Error).message)
+    }
   }
+
+  const rows = users.map((u) => [
+    u.code,
+    u.name,
+    u.email,
+    u.role,
+    u.isActive ? "Active" : "Inactive",
+    myDate(new Date(u.createdAt)),
+  ])
+
   return (
     <div className="p-8">
       <Heading
@@ -2480,57 +2555,181 @@ function Users({
           + Add staff user
         </button>
       </div>
+      {error && (
+        <p role="alert" className="mt-4 rounded bg-[#F5E7E3] px-3 py-2 text-xs text-[#A34E42]">
+          {error}
+        </p>
+      )}
       <Table
         headers={["User ID", "Full name", "Email", "Role", "Status", "Created"]}
         rows={rows}
+        empty={loading ? "Loading users…" : "No users found."}
+        actionWidth={150}
+        action={(index) => {
+          const user = users[index]
+          const self = user.id === currentUserId
+          return (
+            <div className="flex gap-1">
+              <button
+                onClick={() => setResetFor(user)}
+                className="rounded border border-[#D9DAD5] px-2 py-1 text-[10px] font-bold text-[#666A65]"
+                title="Set a new password"
+              >
+                Password
+              </button>
+              <button
+                disabled={self}
+                onClick={() => toggleActive(user)}
+                className="rounded border border-[#D9DAD5] px-2 py-1 text-[10px] font-bold text-[#666A65] disabled:opacity-30"
+                title={self ? "You cannot deactivate your own account" : undefined}
+              >
+                {user.isActive ? "Disable" : "Enable"}
+              </button>
+            </div>
+          )
+        }}
       />
       {addOpen && (
         <AddUserModal
-          nextId={`USR-${String(rows.length + 1).padStart(3, "0")}`}
-          existingEmails={rows.map((row) => row[2].toLowerCase())}
           onClose={() => setAddOpen(false)}
-          onAdd={addUser}
+          onAdded={(user) => {
+            setUsers((current) => [...current, user])
+            setAddOpen(false)
+          }}
+        />
+      )}
+      {resetFor && (
+        <ResetPasswordModal
+          user={resetFor}
+          onClose={() => setResetFor(null)}
+          onDone={(user) => {
+            replace(user)
+            setResetFor(null)
+          }}
         />
       )}
     </div>
   )
 }
 
+// Same rule as the server (server/src/routes/admin.js), checked here for a quicker message.
+const passwordProblem = (password: string) =>
+  password.length < 10
+    ? "Password must be at least 10 characters."
+    : !/[A-Za-z]/.test(password) || !/\d/.test(password)
+      ? "Password needs letters and numbers."
+      : ""
+
+const fieldClass =
+  "mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none focus:border-[#28695E]"
+
+function PasswordFields({
+  label,
+  password,
+  setPassword,
+  confirm,
+  setConfirm,
+}: {
+  label: string
+  password: string
+  setPassword: (value: string) => void
+  confirm: string
+  setConfirm: (value: string) => void
+}) {
+  return (
+    <>
+      <label className="mt-3 block text-left text-xs font-bold">
+        {label}
+        <input
+          type="password"
+          autoComplete="new-password"
+          value={password}
+          onChange={(event) => setPassword(event.target.value)}
+          className={fieldClass}
+        />
+        <span className="mt-1 block text-[10px] font-normal text-[#858983]">
+          At least 10 characters, with letters and numbers.
+        </span>
+      </label>
+      <label className="mt-3 block text-left text-xs font-bold">
+        Confirm password
+        <input
+          type="password"
+          autoComplete="new-password"
+          value={confirm}
+          onChange={(event) => setConfirm(event.target.value)}
+          className={fieldClass}
+        />
+      </label>
+    </>
+  )
+}
+
+function ModalButtons({ busy, label, busyLabel, onClose }: { busy: boolean; label: string; busyLabel: string; onClose: () => void }) {
+  return (
+    <>
+      <button
+        type="submit"
+        disabled={busy}
+        className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white disabled:opacity-60"
+      >
+        {busy ? busyLabel : label}
+      </button>
+      <button
+        type="button"
+        onClick={onClose}
+        className="mt-3 w-full rounded border border-[#D9DAD5] bg-white py-3 text-sm font-bold text-[#666A65]"
+      >
+        Cancel
+      </button>
+    </>
+  )
+}
+
 function AddUserModal({
   onClose,
-  onAdd,
-  nextId,
-  existingEmails,
+  onAdded,
 }: {
   onClose: () => void
-  onAdd: (row: string[]) => void
-  nextId: string
-  existingEmails: string[]
+  onAdded: (user: StaffUser) => void
 }) {
   const [fullName, setFullName] = useState("")
   const [email, setEmail] = useState("")
-  const [role, setRole] = useState("STAFF")
+  const [role, setRole] = useState<Role>("STAFF")
+  const [password, setPassword] = useState("")
+  const [confirm, setConfirm] = useState("")
   const [error, setError] = useState("")
-  const add = () => {
+  const [busy, setBusy] = useState(false)
+  const add = async (event: FormEvent) => {
+    event.preventDefault()
     const cleanEmail = email.trim().toLowerCase()
-    if (!fullName.trim() || !cleanEmail)
-      return setError("Full name and email are required.")
+    if (!fullName.trim() || !cleanEmail) return setError("Full name and email are required.")
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail))
       return setError("Enter a valid email address.")
-    if (existingEmails.includes(cleanEmail))
-      return setError("A user with this email already exists.")
-    onAdd([
-      nextId,
-      fullName.trim(),
-      cleanEmail,
-      role,
-      "Active",
-      myDate(),
-    ])
+    const problem = passwordProblem(password)
+    if (problem) return setError(problem)
+    if (password !== confirm) return setError("Passwords do not match.")
+    setBusy(true)
+    setError("")
+    try {
+      const { user } = await api<{ user: StaffUser }>("/users", {
+        method: "POST",
+        body: { name: fullName.trim(), email: cleanEmail, role, password },
+      })
+      onAdded(user)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
   }
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-[#1F2925]/45 p-6">
-      <div className="w-full max-w-sm rounded-md bg-white p-7 text-center shadow-xl">
+      <form
+        onSubmit={add}
+        noValidate
+        className="w-full max-w-sm rounded-md bg-white p-7 text-center shadow-xl"
+      >
         <h2 className="mt-4 font-display text-xl font-bold">Add staff user</h2>
         {error && (
           <p className="mt-3 rounded bg-[#F5E7E3] px-3 py-2 text-left text-xs text-[#A34E42]">
@@ -2542,42 +2741,100 @@ function AddUserModal({
           <input
             value={fullName}
             onChange={(event) => setFullName(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            className={fieldClass}
           />
         </label>
         <label className="mt-3 block text-left text-xs font-bold">
           Email
           <input
             type="email"
+            autoComplete="off"
             value={email}
             onChange={(event) => setEmail(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            className={fieldClass}
           />
         </label>
         <label className="mt-3 block text-left text-xs font-bold">
           Role
           <select
             value={role}
-            onChange={(event) => setRole(event.target.value)}
-            className="mt-2 w-full border border-[#D9DAD5] bg-white px-4 py-3 text-sm outline-none"
+            onChange={(event) => setRole(event.target.value as Role)}
+            className={fieldClass}
           >
             <option value="STAFF">Staff</option>
             <option value="ADMIN">Admin</option>
           </select>
         </label>
-        <button
-          onClick={add}
-          className="mt-5 w-full rounded bg-[#28695E] py-3 text-sm font-bold text-white"
-        >
-          Add user
-        </button>
-        <button
-          onClick={onClose}
-          className="mt-3 w-full rounded border border-[#D9DAD5] bg-white py-3 text-sm font-bold text-[#666A65]"
-        >
-          Cancel
-        </button>
-      </div>
+        <PasswordFields
+          label="Password"
+          password={password}
+          setPassword={setPassword}
+          confirm={confirm}
+          setConfirm={setConfirm}
+        />
+        <ModalButtons busy={busy} label="Add user" busyLabel="Adding…" onClose={onClose} />
+      </form>
+    </div>
+  )
+}
+
+function ResetPasswordModal({
+  user,
+  onClose,
+  onDone,
+}: {
+  user: StaffUser
+  onClose: () => void
+  onDone: (user: StaffUser) => void
+}) {
+  const [password, setPassword] = useState("")
+  const [confirm, setConfirm] = useState("")
+  const [error, setError] = useState("")
+  const [busy, setBusy] = useState(false)
+  const save = async (event: FormEvent) => {
+    event.preventDefault()
+    const problem = passwordProblem(password)
+    if (problem) return setError(problem)
+    if (password !== confirm) return setError("Passwords do not match.")
+    setBusy(true)
+    setError("")
+    try {
+      const { user: updated } = await api<{ user: StaffUser }>(`/users/${user.id}`, {
+        method: "PATCH",
+        body: { password },
+      })
+      onDone(updated)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-[#1F2925]/45 p-6">
+      <form
+        onSubmit={save}
+        noValidate
+        className="w-full max-w-sm rounded-md bg-white p-7 text-center shadow-xl"
+      >
+        <h2 className="mt-4 font-display text-xl font-bold">Set new password</h2>
+        <p className="mt-1 text-xs text-[#757973]">
+          {user.name} · {user.email}
+        </p>
+        {error && (
+          <p className="mt-3 rounded bg-[#F5E7E3] px-3 py-2 text-left text-xs text-[#A34E42]">
+            {error}
+          </p>
+        )}
+        <PasswordFields
+          label="New password"
+          password={password}
+          setPassword={setPassword}
+          confirm={confirm}
+          setConfirm={setConfirm}
+        />
+        <ModalButtons busy={busy} label="Save password" busyLabel="Saving…" onClose={onClose} />
+      </form>
     </div>
   )
 }
@@ -2598,7 +2855,9 @@ function MalaysiaClock() {
 }
 
 export default function App() {
-  const [role, setRole] = useState<Role | null>(null)
+  const [user, setUser] = useState<SessionUser | null>(null)
+  // True until we know whether a session cookie from an earlier visit is still valid.
+  const [checkingSession, setCheckingSession] = useState(true)
   const [view, setView] = useState<View>("New sale")
   const [cart, setCart] = useState<CartLine[]>([
     { ...products[1], quantity: 2 },
@@ -2609,13 +2868,20 @@ export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>(initialTransactions)
   const [catalogue, setCatalogue] = useState<Product[]>(products)
   const [movements, setMovements] = useState<Movement[]>(initialMovements)
-  const [users, setUsers] = useState<string[][]>(initialUsers)
   const [recipes, setRecipes] = useState<RecipeLine[]>(initialRecipes)
   const [targetMargin, setTargetMargin] = useState(0.6)
   const [nextSale, setNextSale] = useState(1048)
   const [nextPurchase, setNextPurchase] = useState(40)
   const [nextMovement, setNextMovement] = useState(2082)
   const lowStockCount = catalogue.filter((p) => p.stock <= p.reorder).length
+
+  // Restore the session on page load: the cookie is httpOnly, so ask the server who we are.
+  useEffect(() => {
+    api<{ user: SessionUser }>("/auth/me")
+      .then(({ user }) => setUser(user))
+      .catch(() => setUser(null))
+      .finally(() => setCheckingSession(false))
+  }, [])
 
   // Applies stock deltas to the catalogue and appends one movement per line.
   const recordMovements = (
@@ -2645,17 +2911,29 @@ export default function App() {
     setNextMovement((n) => n + lines.length)
   }
 
-  if (!role)
+  if (checkingSession)
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#F5F4F0] text-xs text-[#858983]">
+        Loading…
+      </main>
+    )
+  if (!user)
     return (
       <Login
-        onLogin={(nextRole) => {
-          setRole(nextRole)
+        onLogin={(signedIn) => {
+          setUser(signedIn)
           setView("New sale")
         }}
       />
     )
+  const role = user.role
   const allowed = (item: NavigationItem) => !item.admin || role === "ADMIN"
-  const currentUser = userName(role)
+  const currentUser = user.name
+  const signOut = async () => {
+    // Clear the screen even if the request fails; the cookie expires on its own.
+    await api("/auth/logout", { method: "POST" }).catch(() => {})
+    setUser(null)
+  }
   const saleNumber = `SL-${nextSale}`
 
   const postSale = () => {
@@ -2727,7 +3005,7 @@ export default function App() {
             {currentUser} · {role}
           </span>
           <button
-            onClick={() => setRole(null)}
+            onClick={signOut}
             title="Sign out"
             aria-label="Sign out"
           >
@@ -2820,7 +3098,7 @@ export default function App() {
           )}
           {view === "Stock movements" && <StockMovements movements={movements} />}
           {view === "Forecasts" && <Forecasts catalogue={catalogue} />}
-          {view === "Users" && <Users rows={users} setRows={setUsers} />}
+          {view === "Users" && <Users currentUserId={user.id} />}
         </section>
       </div>
       {posted && (
